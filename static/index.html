@@ -1,0 +1,120 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Scrapling Studio</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<aside>
+  <div class="brand"><span>◈</span> Scrapling Studio</div>
+  <div class="nav">
+    <a href="#top" class="active">Crawler</a>
+    <a href="#access">Access &amp; profiles</a>
+    <a href="#history">History</a>
+    <a href="/logout">Sign out</a>
+  </div>
+  <div class="side-note">
+    <div id="providers"></div>
+    Adaptive extraction workspace<br><small>Built on Scrapling 0.4.x</small>
+  </div>
+</aside>
+<main id="top">
+  <header>
+    <div><p class="eyebrow">SCRAPLING ENGINE</p><h1>Web Extraction Studio</h1><p class="muted">Crawl, render, extract, enrich and export company data.</p></div>
+    <div id="state" class="pill idle">READY</div>
+  </header>
+
+  <section class="card target">
+    <div class="row">
+      <div class="grow"><label>Target URL<input id="url" placeholder="https://arbisoft.com" value="https://arbisoft.com"></label></div>
+      <button id="start">Start crawl</button>
+    </div>
+    <div class="grid controls">
+      <label>Fetch mode<select id="mode">
+        <option value="auto">Auto (HTTP → browser → stealth)</option><option value="http">HTTP only</option>
+        <option value="dynamic">Dynamic browser</option><option value="stealth">Stealth browser</option></select></label>
+      <label>Max pages<input id="max_pages" type="number" value="20" min="1" max="500"></label>
+      <label>Depth<input id="depth" type="number" value="2" min="0" max="5"></label>
+      <label>Concurrency<input id="concurrency" type="number" value="4" min="1" max="16"></label>
+      <label>Browser tabs<input id="browser_pages" type="number" value="3" min="1" max="4"></label>
+      <label>Timeout (ms)<input id="timeout" type="number" value="30000"></label>
+    </div>
+    <div class="checks">
+      <label><input id="enrich" type="checkbox" checked> Enrich after crawl</label>
+      <label><input id="ai" type="checkbox" checked> AI analysis <small class="muted" id="aiNote"></small></label>
+      <label><input id="escalate" type="checkbox" checked> Escalate when blocked</label>
+      <label><input id="respect_robots" type="checkbox" checked> Respect robots.txt</label>
+      <label><input id="adaptive" type="checkbox" checked> Adaptive extraction</label>
+      <label><input id="network_idle" type="checkbox"> Network idle</label>
+      <label><input id="disable_resources" type="checkbox" checked> Block unnecessary resources</label>
+      <label><input id="capture_xhr" type="checkbox"> Capture XHR/fetch</label>
+    </div>
+    <details class="access-opts">
+      <summary>Access options <small class="muted">auth profile · delay · proxies</small></summary>
+      <div class="grid access-grid">
+        <label>Auth profile<select id="profile"><option value="">None</option></select></label>
+        <label>Delay per request (ms)<input id="delay_ms" type="number" value="0" min="0" max="60000"></label>
+        <label class="span2">Proxies <small class="muted">(one per line, http://user:pass@host:port; rotated)</small><textarea id="proxies" rows="2" placeholder="http://user:pass@proxy1:8080"></textarea></label>
+      </div>
+    </details>
+  </section>
+
+  <section id="progress" class="card hidden">
+    <div class="section-head"><h2>Crawl activity</h2><span id="progressText">0 pages</span></div>
+    <div class="bar"><i id="bar"></i></div>
+    <div id="enrichStep" class="muted small hidden"></div>
+    <div id="pages" class="page-list"></div>
+  </section>
+
+  <section id="results" class="hidden">
+    <div class="section-head">
+      <div><p class="eyebrow">RESULT</p><h2 id="resultTitle">Company profile</h2></div>
+      <div class="exports"><a id="xlsx">XLSX</a><a id="csv">CSV</a><a id="json">JSON</a></div>
+    </div>
+    <div id="blocked" class="banner hidden"></div>
+    <div id="stats" class="stats"></div>
+    <div class="tabs">
+      <button class="tab active" data-tab="enriched">Enriched profile</button>
+      <button class="tab" data-tab="fields">Extracted fields</button>
+      <button class="tab" data-tab="sources">Pages</button>
+      <button class="tab" data-tab="raw">Raw JSON</button>
+    </div>
+    <div id="enriched" class="tabpane"></div>
+    <div id="fields" class="tabpane card table-wrap hidden"><table><thead><tr><th>Field</th><th>Value</th><th>Confidence</th><th>Source</th></tr></thead><tbody id="data"></tbody></table></div>
+    <div id="sources" class="tabpane card hidden"></div>
+    <pre id="raw" class="tabpane card raw hidden"></pre>
+  </section>
+
+  <section id="access" class="card">
+    <div class="section-head"><div><p class="eyebrow">ACCESS</p><h2>Auth profiles</h2></div><button id="refreshProfiles" class="ghost">Refresh</button></div>
+    <p class="muted small">A profile holds cookies (and optional headers / user-agent) that every fetch mode sends. Use it for sites that need a login, or for sites that show a CAPTCHA: open the site in a real browser window, log in or solve the challenge yourself, then click <b>Finish &amp; save</b>. Select the profile under <i>Access options</i> when crawling. Cookies are stored in plain text in <code>data/profiles</code>.</p>
+    <div id="profileRows"></div>
+    <div class="two-col">
+      <div class="subcard">
+        <h3>Log in / solve a challenge in a browser</h3>
+        <label>Profile name<input id="bName" placeholder="e.g. example-com"></label>
+        <label>Start URL<input id="bUrl" placeholder="https://example.com/login"></label>
+        <div class="btns"><button id="bOpen">Open browser</button><button id="bFinish" class="ghost">Finish &amp; save</button></div>
+        <div id="bStatus" class="muted small"></div>
+      </div>
+      <div class="subcard">
+        <h3>Import cookies</h3>
+        <label>Profile name<input id="cName" placeholder="e.g. example-com"></label>
+        <label>Domain<input id="cDomain" placeholder="example.com (needed for name=value strings)"></label>
+        <label>Cookies <small class="muted">JSON export, cookies.txt, or "a=1; b=2"</small><textarea id="cCookies" rows="3"></textarea></label>
+        <label>Extra headers <small class="muted">one "Name: value" per line (optional)</small><textarea id="cHeaders" rows="2" placeholder="Authorization: Bearer …"></textarea></label>
+        <label>User-agent <small class="muted">(optional; match the browser the cookies came from)</small><input id="cUa"></label>
+        <div class="btns"><button id="cSave">Save profile</button></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="history" class="card history">
+    <div class="section-head"><h2>Recent crawls</h2><button id="refresh" class="ghost">Refresh</button></div>
+    <div id="historyRows"></div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

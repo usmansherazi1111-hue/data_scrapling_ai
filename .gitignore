@@ -1,0 +1,16 @@
+# Local environment and secrets
+.venv/
+.env
+
+# Runtime data: crawl history, auth-profile cookies, tunnel credentials
+data/
+
+# Tunnel binary (download separately, see README)
+bin/
+
+# Python / OS noise
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+Thumbs.db

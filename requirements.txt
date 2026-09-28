@@ -1,0 +1,10 @@
+scrapling[fetchers,rag]>=0.4.15,<0.5
+fastapi>=0.116
+uvicorn[standard]>=0.35
+pydantic>=2.11
+httpx>=0.28
+openpyxl>=3.1
+python-multipart>=0.0.20
+python-dotenv>=1.0
+dnspython>=2.6
+phonenumbers>=8.13
