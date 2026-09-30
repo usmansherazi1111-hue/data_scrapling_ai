@@ -1,5 +1,6 @@
 from __future__ import annotations
-import asyncio, csv, io, json, os, uuid
+from urllib.parse import urlparse
+import asyncio, csv, io, json, os, re, uuid
 from fastapi import FastAPI, HTTPException, Request, Form
 from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,11 +15,14 @@ from scraper.urltools import normalize_url
 from scraper.auth import ProfileStore, parse_cookies
 from scraper.enrichment import flatten
 from scraper import ai, security
+from scraper import opencorporates as oc, registries, overture
+from scraper.models import now_iso
 
-app = FastAPI(title="Scrapling Studio", version="1.1.0")
+VERSION = "2.0.1"
+app = FastAPI(title="Scrapling Studio", version=VERSION)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 DB_PATH = os.getenv("DB_PATH", "./data/scrapling.db")
-DB = HistoryDB(DB_PATH); JOBS = {}; TASKS = set()
+DB = HistoryDB(DB_PATH); JOBS = {}; TASKS = set(); REGISTRY_RUNS = {}
 PROFILES = ProfileStore(os.path.join(os.path.dirname(DB_PATH) or ".", "profiles"))
 ENGINE = CrawlEngine(DB, JOBS, PROFILES)
 
@@ -40,6 +44,7 @@ class CrawlRequest(BaseModel):
     disable_resources: bool = True
     capture_xhr: bool = False
     ai_enrichment: bool = True
+    registry_lookup: bool = True
     enrich: bool = True
     escalate: bool = True
     respect_robots: bool = True
@@ -53,7 +58,10 @@ class CrawlRequest(BaseModel):
 async def require_login(request: Request, call_next):
     open_paths = ("/login", "/static/app.css")
     if request.url.path in open_paths or security.is_authenticated(request.cookies.get(security.COOKIE)):
-        return await call_next(request)
+        response = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"  # always pick up a new version of the UI after an update
+        return response
     if request.url.path.startswith("/api/"): return JSONResponse({"detail": "Not signed in"}, status_code=401)
     return RedirectResponse("/login", status_code=303)
 
@@ -84,7 +92,7 @@ async def index(): return FileResponse("static/index.html")
 
 @app.get("/api/status")
 async def status():
-    return {"ai": ai.configured(), "ai_model": os.getenv("AI_MODEL", "gpt-4.1-mini") if ai.configured() else None, "hunter": bool(os.getenv("HUNTER_API_KEY"))}
+    return {"version": VERSION, "ai": ai.configured(), "ai_model": os.getenv("AI_MODEL", "gpt-4.1-mini") if ai.configured() else None, "hunter": bool(os.getenv("HUNTER_API_KEY")), "opencorporates": oc.configured(), "registries": registries.available()}
 
 
 @app.post("/api/jobs")
@@ -109,11 +117,11 @@ async def job(job_id: str): return result_for(job_id)
 
 
 @app.post("/api/jobs/{job_id}/enrich")
-async def enrich(job_id: str, ai_enrichment: bool = True):
+async def enrich(job_id: str, ai_enrichment: bool = True, registry_lookup: bool = True):
     r = result_for(job_id)
     if r["status"] == "running": raise HTTPException(409, "Crawl still running")
     if (r.get("enrichment") or {}).get("status") == "running": raise HTTPException(409, "Enrichment already running")
-    background(ENGINE.enrich(job_id, use_ai=ai_enrichment))
+    background(ENGINE.enrich(job_id, use_ai=ai_enrichment, use_registry=registry_lookup))
     return {"ok": True}
 
 
@@ -177,6 +185,218 @@ async def finish_browser(name: str):
     return {"ok": True, "profile": next((p for p in PROFILES.list() if p["name"] == name), None)}
 
 
+# ---------------------------------------------------------------- company lists: industry + country -> companies -> automatic website crawl -> Excel
+MAX_LIST = int(os.getenv("COMPANY_LIST_MAX", "200"))
+CRAWL_PAGES = int(os.getenv("COMPANY_CRAWL_PAGES", "6"))
+# Latency caps for list crawls: most sites answer in a few seconds; a few protected ones take minutes and would stall the list.
+CRAWL_FETCH_MS = int(os.getenv("COMPANY_FETCH_TIMEOUT_MS", "15000"))
+CRAWL_PAGE_SECONDS = float(os.getenv("COMPANY_PAGE_SECONDS", "25"))
+CRAWL_SITE_SECONDS = float(os.getenv("COMPANY_SITE_SECONDS", "45"))
+CRAWL_CONCURRENCY = int(os.getenv("COMPANY_CRAWL_CONCURRENCY", "8"))
+
+
+class CompanySearchRequest(BaseModel):
+    industry: str = Field(default="", max_length=100)   # any words: "textile", "medicine", "software"
+    country: str = Field(default="", max_length=60)     # "pk", "Pakistan", "UK"
+    name: str = Field(default="", max_length=100)       # optional: only companies whose name contains this
+    limit: int = Field(default=50, ge=5, le=MAX_LIST)   # how many companies to keep and crawl
+    crawl: bool = True
+
+
+def new_run(label, query):
+    run = {"id": uuid.uuid4().hex[:12], "created_at": now_iso(), "kind": "companies", "label": label[:200], "status": "running", "query": query, "source": "overture",
+           "companies": [], "progress": "starting", "error": None, "notes": [], "total_count": None, "crawl": {"status": "idle", "done": 0, "total": 0, "failed": 0}}
+    REGISTRY_RUNS[run["id"]] = run; DB.save_registry(run); return run
+
+
+def company_site(c: dict) -> str | None:
+    """The company's home page (Overture often stores a deep link such as /careers)."""
+    w = (c.get("website") or "").strip()
+    if not w: return None
+    u = normalize_url(w if w.startswith(("http://", "https://")) else "http://" + w)
+    return re.sub(r"^(https?://[^/]+).*$", r"\1", u) if u else None
+
+
+def keep_profile(enrichment: dict | None) -> dict:
+    e = enrichment or {}
+    return {"people": e.get("people", [])[:10], "emails": (e.get("contacts") or {}).get("emails", [])[:30], "phones": (e.get("contacts") or {}).get("phones", [])[:15],
+            "social": {k: v.get("url") for k, v in (e.get("social") or {}).items()}, "tech_stack": [t.get("name") for t in e.get("tech_stack", [])][:30]}
+
+
+async def domain_resolves(url: str) -> bool:
+    """Dead domains are common in map data; failing them here saves launching a browser for each one."""
+    import socket
+    host = urlparse(url).hostname or ""
+    try:
+        await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM), 8)
+        return True
+    except socket.gaierror:
+        return False
+    except Exception:
+        return True   # slow or odd resolver: let the crawl decide
+
+
+async def crawl_company(c: dict, sem, state, run):
+    async with sem:
+        url = company_site(c)
+        c["crawl_status"] = "running"; state["current"] = c.get("name")
+        try:
+            if not url or not await security.is_public_url(url): raise ValueError("website is not a public address")
+            if not await domain_resolves(url): raise ValueError("website domain does not exist (DNS)")
+            job_id = uuid.uuid4().hex[:12]; c["job_id"] = job_id
+            cfg = CrawlRequest(url=url, max_pages=CRAWL_PAGES, depth=1, ai_enrichment=True, registry_lookup=False, timeout=CRAWL_FETCH_MS, concurrency=CRAWL_PAGES).model_dump()
+            cfg.update(page_time_limit=CRAWL_PAGE_SECONDS, time_budget=CRAWL_SITE_SECONDS, markdown=False, parse_in_thread=os.getenv("COMPANY_PARSE_IN_THREAD", "1") != "0")
+            res = (await ENGINE.run(job_id, url, cfg)).jsonable()
+            c["crawl_status"] = res["status"]
+            if "pages" in res and not any(200 <= (p.get("status") or 0) < 400 for p in res["pages"]):
+                codes = sorted({str(p.get("status") or p.get("error") or "no answer")[:40] for p in res["pages"]})
+                c["crawl_status"] = "failed"; c["crawl_error"] = "website not readable (" + ", ".join(codes[:3]) + ")"; state["failed"] += 1
+            c["details"] = {k: v for k, v in flatten(res.get("enrichment")).items() if v not in (None, "", False)}
+            c["profile"] = keep_profile(res.get("enrichment"))
+            if res["status"] != "completed" and not c.get("crawl_error"): c["crawl_error"] = str((res.get("stats") or {}).get("error", ""))[:200]
+        except Exception as e:
+            c["crawl_status"] = "failed"; c["crawl_error"] = str(e)[:200]; state["failed"] += 1
+        state["done"] += 1; DB.save_registry(run)
+
+
+async def run_company_search(run, req: CompanySearchRequest):
+    error = None
+    try:
+        cc = overture.country_code(req.country)
+        if cc:
+            run["progress"] = f"reading open company data for {overture.country_name(cc)}"
+            def progress(m): run["progress"] = m
+            res = await overture.search(req.industry, req.country, req.name, req.limit, progress=progress)
+            run["companies"] = res["companies"]; run["total_count"] = res["matched"]
+            run["notes"].append(f"{res['matched']:,} companies match. Showing the {len(res['companies'])} with the most contact details (websites and emails first).")
+            if res.get("partial"): run["notes"].append(res["partial"])
+        elif req.country.strip():
+            raise overture.OvertureError(f"Unknown country '{req.country.strip()}'. Use a country name or a 2-letter code like pk, gb or us.")
+        elif req.name.strip():   # no country: look the name up in the official LEI register
+            run["source"] = "gleif"; run["progress"] = "searching GLEIF by name"
+            res = await registries.search("gleif", req.name.strip(), per_page=min(req.limit, 100))
+            run["companies"] = res["companies"]; run["total_count"] = res["total_count"]
+            run["notes"].append("No country given, so the official LEI register (GLEIF) was searched by name. Add a country and an industry to list companies.")
+        else:
+            raise overture.OvertureError("Enter an industry and a country.")
+    except Exception as e:
+        error = str(e)[:500]
+    run["status"] = "failed" if error and not run["companies"] else "completed"; run["error"] = error
+    DB.save_registry(run)
+    if req.crawl and run["companies"]:
+        todo = [c for c in run["companies"] if company_site(c)]
+        state = run["crawl"] = {"status": "running", "done": 0, "total": len(todo), "failed": 0, "current": None, "started_at": now_iso()}
+        run["progress"] = f"crawling {len(todo)} company websites"; DB.save_registry(run)
+        sem = asyncio.Semaphore(CRAWL_CONCURRENCY)
+        try:
+            await asyncio.gather(*(crawl_company(c, sem, state, run) for c in todo))
+        finally:
+            state.update(status="completed", current=None, finished_at=now_iso())
+    run["progress"] = "done"; run["finished_at"] = now_iso(); DB.save_registry(run); REGISTRY_RUNS.pop(run["id"], None)
+
+
+@app.post("/api/companies/search")
+async def companies_search(req: CompanySearchRequest):
+    if not (req.industry.strip() or req.name.strip()): raise HTTPException(400, "Enter an industry (for example textile) and a country (for example pk)")
+    if req.industry.strip() and not req.country.strip(): raise HTTPException(400, "Enter a country too, for example pk or Pakistan")
+    run = new_run(" · ".join(x for x in (req.industry.strip(), req.country.strip(), req.name.strip()) if x), req.model_dump())
+    background(run_company_search(run, req))
+    return {"id": run["id"]}
+
+
+@app.get("/api/companies")
+async def companies_lists(): return DB.list_registry()
+
+
+def run_for(list_id):
+    r = REGISTRY_RUNS.get(list_id) or DB.get_registry(list_id)
+    if not r: raise HTTPException(404, "List not found")
+    return r
+
+
+@app.get("/api/companies/{list_id}")
+async def companies_list(list_id: str): return run_for(list_id)
+
+
+LICENCES = {"overture": "Overture Maps places: (c) Overture Maps Foundation, CDLA Permissive 2.0. https://overturemaps.org",
+            "gleif": "GLEIF LEI data: CC0 (no restrictions). https://www.gleif.org"}
+SUMMARY_COLS = ["name", "category", "city", "country_code", "registered_address", "website", "email", "phone", "lead_score", "lead_grade", "decision_maker", "decision_maker_title",
+                "decision_maker_email", "all_emails", "phones_e164", "social_linkedin", "social_facebook", "social_instagram", "social_twitter", "tech_stack", "crawl_status", "source"]
+
+
+def summary_row(c):
+    d = dict(c.get("details") or {})
+    row = {**{k: v for k, v in c.items() if k not in ("details", "profile", "socials")}, **d}
+    emails = [e.strip() for e in str(row.get("all_emails") or "").split(",") if e.strip()]
+    if c.get("email") and c["email"] not in emails: emails.insert(0, c["email"]); row["all_emails"] = ", ".join(emails)
+    for s in c.get("socials") or []:
+        for k in ("linkedin", "facebook", "instagram", "twitter"):
+            if k in s and not row.get(f"social_{k}"): row[f"social_{k}"] = s
+    return row
+
+
+def sheet_name(i, name, used):
+    base = re.sub(r"[\[\]:*?/\\]", " ", f"{i:03d} {name or 'company'}").strip()[:28].strip()
+    n, k = base, 2
+    while n.lower() in used: n = f"{base[:25]}~{k}"; k += 1
+    used.add(n.lower()); return n
+
+
+def build_workbook(r):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    cs = r["companies"]; wb = Workbook(); ws = wb.active; ws.title = "Summary"; used = {"summary", "sources"}
+    extra = [k for k in dict.fromkeys(k for c in cs for k in summary_row(c)) if k not in SUMMARY_COLS and k not in ("source_id", "category_path", "confidence", "job_id", "crawl_error", "jurisdiction_code")]
+    cols = [c for c in SUMMARY_COLS if any(summary_row(x).get(c) not in (None, "") for x in cs)] + [k for k in extra if any(summary_row(x).get(k) not in (None, "") for x in cs)]
+    names = [sheet_name(i, c.get("name"), used) for i, c in enumerate(cs, 1)]
+    ws.append(["sheet"] + cols)
+    for n, c in zip(names, cs):
+        row = summary_row(c); ws.append([n] + [(", ".join(map(str, v)) if isinstance(v := row.get(k), list) else v) for k in cols])
+        cell = ws.cell(row=ws.max_row, column=1); cell.hyperlink = f"#'{n}'!A1"; cell.font = Font(color="0563C1", underline="single")
+    for i, n in enumerate(names):
+        c = cs[i]; s = wb.create_sheet(n); p = c.get("profile") or {}; row = summary_row(c)
+        s.append(["Company", c.get("name")])
+        for k, v in row.items():
+            if k in ("name", "source_id", "job_id") or v in (None, "", []) or isinstance(v, (dict, list)): continue
+            s.append([k.replace("_", " "), v])
+        if c.get("crawl_error"): s.append(["crawl note", c["crawl_error"]])
+        for title, hdr, items in (("People", ["name", "title", "email", "email_guess", "source_url"], p.get("people")),
+                                  ("Emails", ["email", "type", "on_company_domain", "domain_accepts_mail"], p.get("emails")),
+                                  ("Phones", ["raw", "e164", "valid", "country", "type"], p.get("phones"))):
+            if not items: continue
+            s.append([]); s.append([title]); s.cell(row=s.max_row, column=1).font = Font(bold=True, size=12); s.append(hdr)
+            for cell in s[s.max_row]: cell.font = Font(bold=True); cell.fill = PatternFill("solid", fgColor="EEEEEE")
+            for it in items: s.append([json.dumps(it.get(h), ensure_ascii=False) if isinstance(it.get(h), (list, dict)) else it.get(h) for h in hdr])
+        s.append([]); s.append(["Back to summary"]); s.cell(row=s.max_row, column=1).hyperlink = "#'Summary'!A1"
+        s.column_dimensions["A"].width = 28; s.column_dimensions["B"].width = 60
+        for cell in s["A"][:1]: cell.font = Font(bold=True)
+    src = wb.create_sheet("Sources")
+    src.append([f"Search: {r['label']}"]); src.append([f"Created: {r['created_at']}"])
+    for s_ in sorted({c.get("source") for c in cs if c.get("source")}): src.append([LICENCES.get(s_, s_)])
+    for cell in ws[1]: cell.font = Font(bold=True); cell.fill = PatternFill("solid", fgColor="DDEBF7")
+    for j, col in enumerate(ws.columns, 1): ws.column_dimensions[get_column_letter(j)].width = min(45, max(12, max(len(str(c.value or "")) for c in col[:60]) + 2))
+    ws.freeze_panes = "B2"; ws.auto_filter.ref = ws.dimensions
+    return wb
+
+
+@app.get("/api/companies/{list_id}/export/{kind}")
+async def companies_export(list_id: str, kind: str):
+    r = run_for(list_id); fn = f"companies_{re.sub(r'[^a-z0-9]+', '_', r['label'].lower()).strip('_')[:40]}_{list_id[:6]}"
+    if kind == "json":
+        return StreamingResponse(io.BytesIO(json.dumps(r, ensure_ascii=False, indent=2).encode()), media_type="application/json", headers={"Content-Disposition": f'attachment; filename="{fn}.json"'})
+    if kind == "csv":
+        rows = [summary_row(c) for c in r["companies"]]
+        cols = [k for k in SUMMARY_COLS if any(x.get(k) not in (None, "") for x in rows)]
+        b = io.StringIO(); w = csv.writer(b); w.writerow(cols)
+        for x in rows: w.writerow([", ".join(map(str, v)) if isinstance(v := x.get(k), list) else v for k in cols])
+        return StreamingResponse(iter([b.getvalue().encode("utf-8-sig")]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{fn}.csv"'})
+    if kind == "xlsx":
+        out = io.BytesIO(); build_workbook(r).save(out); out.seek(0)
+        return StreamingResponse(out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{fn}.xlsx"'})
+    raise HTTPException(400, "Unsupported export")
+
+
 # ---------------------------------------------------------------- exports
 def export_row(r):
     row = {k: (v.get("value") if isinstance(v, dict) else v) for k, v in r["fields"].items()}
@@ -205,6 +425,8 @@ async def export(job_id: str, kind: str):
             "Tech stack": (["name", "category", "pages", "evidence", "source_url"], e.get("tech_stack", [])),
             "Pages": (["url", "category", "status", "mode", "elapsed_ms", "challenge", "error"], r.get("pages", [])),
         }
+        if e.get("registry"):
+            sheets["Registry officers"] = (["name", "position", "start_date", "end_date", "current", "opencorporates_url"], e["registry"].get("officers", []))
         for title, (cols, items) in sheets.items():
             s = wb.create_sheet(title); s.append(cols)
             for it in items: s.append([json.dumps(it.get(c), ensure_ascii=False) if isinstance(it.get(c), (list, dict)) else it.get(c) for c in cols])
@@ -217,6 +439,13 @@ async def export(job_id: str, kind: str):
 
 
 if __name__ == "__main__":
-    import sys, uvicorn
+    import socket, sys, uvicorn
+    host, port = os.getenv("HOST", "127.0.0.1"), int(os.getenv("PORT", "8000"))
+    with socket.socket() as s:
+        if s.connect_ex(("127.0.0.1" if host in ("0.0.0.0", "") else host, port)) == 0:
+            print(f"\nPort {port} is already in use, most likely by an older copy of Scrapling Studio that is still running.\n"
+                  f"Close that window (or end its python.exe in Task Manager) and run this again, or set PORT=8001 in .env.\n")
+            sys.exit(1)
+    print(f"\nScrapling Studio {VERSION}  on http://{host}:{port}\n")
     if sys.platform == "win32": asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())  # Playwright needs subprocess support
-    uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "8000")), loop="asyncio")
+    uvicorn.run(app, host=host, port=port, loop="asyncio")

@@ -25,3 +25,16 @@ table.mini{width:100%;border-collapse:collapse;margin-bottom:10px}table.mini th,
 #enrichStep{margin-top:10px}
 @media(max-width:1000px){.egrid,.two-col{grid-template-columns:1fr}.access-grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(3,1fr)}.checks-list{columns:1}.kv{grid-template-columns:1fr}}
 .kv a,.ecard a{color:var(--accent);text-decoration:none}
+.oc-grid{grid-template-columns:1fr 1fr;gap:4px 12px}.oc-grid .span2{grid-column:1/-1}.oc-head{margin-top:18px}.oc-head h3{margin:0}.oc-sub{margin:18px 0 6px;font-size:14px}
+#registry .history-row{grid-template-columns:140px 1fr 110px 100px}.oc-officers td{background:var(--panel2)}#registry .subcard .checks{margin-top:10px}
+#registry a,#registry p a{color:var(--accent);text-decoration:none}
+
+.oc-crawl { margin: 10px 0; padding: 10px 12px; border: 1px solid var(--line, #ddd); border-radius: 8px; }
+.oc-crawl input[type=number] { width: 70px; display: inline-block; margin: 0 4px; }
+.oc-crawl label.inline { display: inline-flex; align-items: center; gap: 4px; margin-left: 8px; }
+.oc-crawl label.inline input { width: auto; }
+.oc-det { display: block; margin-top: 3px; }
+.fc-form{grid-template-columns:2fr 1.4fr 1.4fr 90px auto;align-items:end;margin-top:14px}.fc-go button{width:100%}
+.bar{margin:10px 0}#companies a,#companies td a{color:var(--accent);text-decoration:none}
+#companies .history-row{grid-template-columns:140px 1fr 110px 100px}
+@media(max-width:1000px){.fc-form{grid-template-columns:1fr}}

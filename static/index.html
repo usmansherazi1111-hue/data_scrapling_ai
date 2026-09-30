@@ -9,27 +9,54 @@
 <aside>
   <div class="brand"><span>◈</span> Scrapling Studio</div>
   <div class="nav">
-    <a href="#top" class="active">Crawler</a>
+    <a href="#companies" class="active">Find companies</a>
+    <a href="#crawler">Crawl one website</a>
     <a href="#access">Access &amp; profiles</a>
     <a href="#history">History</a>
     <a href="/logout">Sign out</a>
   </div>
   <div class="side-note">
     <div id="providers"></div>
-    Adaptive extraction workspace<br><small>Built on Scrapling 0.4.x</small>
+    Adaptive extraction workspace<br><small>Built on Scrapling 0.4.x · <span id="appVersion">v1.3</span></small>
   </div>
 </aside>
 <main id="top">
   <header>
-    <div><p class="eyebrow">SCRAPLING ENGINE</p><h1>Web Extraction Studio</h1><p class="muted">Crawl, render, extract, enrich and export company data.</p></div>
+    <div><p class="eyebrow">SCRAPLING STUDIO</p><h1>Company lead finder</h1><p class="muted">Industry + country in, companies with contact details out.</p></div>
     <div id="state" class="pill idle">READY</div>
   </header>
 
-  <section class="card target">
+  <section id="companies" class="card">
+    <div class="section-head"><div><p class="eyebrow">STEP 1</p><h2>Find companies</h2></div></div>
+    <p class="muted small">Type any industry and a country. The app lists the companies, opens every company website automatically and collects emails, phones, people and social links. Then download one Excel file with a Summary sheet and one sheet per company.</p>
+    <div class="grid fc-form">
+      <label>Industry<input id="fcInd" placeholder="e.g. textile, medicine, software, steel"></label>
+      <label>Country<input id="fcCountry" placeholder="e.g. pk or Pakistan"></label>
+      <label>Company name <small class="muted">(optional)</small><input id="fcName"></label>
+      <label>How many<select id="fcLimit"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></label>
+      <div class="fc-go"><button id="fcSearch">Find companies</button></div>
+    </div>
+    <div id="fcResult" class="hidden">
+      <div class="section-head oc-head"><div><h3 id="fcTitle">Results</h3><div id="fcProgress" class="muted small"></div></div>
+        <div id="fcExports" class="exports hidden"><a id="fcXlsx">Download Excel</a><a id="fcCsv">CSV</a></div></div>
+      <div class="bar"><i id="fcBar"></i></div>
+      <div id="fcNotes"></div>
+      <div class="table-wrap"><table class="mini"><thead><tr><th>#</th><th>Company</th><th>Website &amp; listed contact</th><th>Found on the website</th><th></th></tr></thead><tbody id="fcRows"></tbody></table></div>
+      <div class="btns"><button id="fcMore" class="ghost hidden">Show next 25</button></div>
+      <p class="muted small" id="fcAttribution"></p>
+    </div>
+    <h3 class="oc-sub">Earlier searches</h3>
+    <div id="fcLists"></div>
+  </section>
+
+
+  <section id="crawler" class="card target">
+    <div class="section-head"><div><p class="eyebrow">ONE COMPANY</p><h2>Crawl one website</h2></div></div>
     <div class="row">
       <div class="grow"><label>Target URL<input id="url" placeholder="https://arbisoft.com" value="https://arbisoft.com"></label></div>
       <button id="start">Start crawl</button>
     </div>
+    <details class="access-opts"><summary>Crawl options</summary>
     <div class="grid controls">
       <label>Fetch mode<select id="mode">
         <option value="auto">Auto (HTTP → browser → stealth)</option><option value="http">HTTP only</option>
@@ -43,6 +70,7 @@
     <div class="checks">
       <label><input id="enrich" type="checkbox" checked> Enrich after crawl</label>
       <label><input id="ai" type="checkbox" checked> AI analysis <small class="muted" id="aiNote"></small></label>
+      <label><input id="registry_lookup" type="checkbox" checked> Company registry lookup <small class="muted" id="ocNote"></small></label>
       <label><input id="escalate" type="checkbox" checked> Escalate when blocked</label>
       <label><input id="respect_robots" type="checkbox" checked> Respect robots.txt</label>
       <label><input id="adaptive" type="checkbox" checked> Adaptive extraction</label>
@@ -50,6 +78,7 @@
       <label><input id="disable_resources" type="checkbox" checked> Block unnecessary resources</label>
       <label><input id="capture_xhr" type="checkbox"> Capture XHR/fetch</label>
     </div>
+    </details>
     <details class="access-opts">
       <summary>Access options <small class="muted">auth profile · delay · proxies</small></summary>
       <div class="grid access-grid">

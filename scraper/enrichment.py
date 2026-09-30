@@ -1,8 +1,9 @@
 """Enrichment phase: turns a finished crawl into a company profile with verified/derived data.
 
 Works without any API keys (DNS, RDAP, tech fingerprints, text mining, phone parsing, email
-pattern inference, GitHub public API). Optional providers: Hunter.io (HUNTER_API_KEY) and an
-OpenAI-compatible LLM (AI_API_KEY). Every value carries its source so it can be audited.
+pattern inference, GitHub public API). Optional providers: Hunter.io (HUNTER_API_KEY), an
+OpenAI-compatible LLM (AI_API_KEY) and company registries: GLEIF (free, no key), Companies House
+(COMPANIES_HOUSE_API_KEY, free) and OpenCorporates (OPENCORPORATES_API_TOKEN). Every value carries its source so it can be audited.
 """
 from __future__ import annotations
 import asyncio, os, re, time
@@ -10,8 +11,10 @@ from collections import Counter
 from urllib.parse import urlparse
 
 import httpx
+from .net import shared_ssl
 
 from . import ai
+from . import opencorporates as oc, registries
 from .urltools import domain as domain_of
 
 ROLE_LOCALS = {"info", "contact", "hello", "sales", "support", "admin", "office", "hr", "careers", "jobs", "marketing", "press", "media", "billing",
@@ -52,7 +55,7 @@ DOH = ["https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"]
 
 async def dns_query(name: str, rtype: str) -> list[str]:
     """DNS-over-HTTPS first (immune to broken local resolvers/VPN DNS), then the system resolver."""
-    async with httpx.AsyncClient(timeout=6) as c:
+    async with httpx.AsyncClient(verify=shared_ssl(), timeout=6) as c:
         for url in DOH:
             try:
                 r = await c.get(url, params={"name": name, "type": rtype}, headers={"Accept": "application/dns-json"})
@@ -85,7 +88,7 @@ async def dns_lookup(domain: str) -> dict:
 
 
 async def rdap_lookup(domain: str) -> dict | None:
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+    async with httpx.AsyncClient(verify=shared_ssl(), timeout=15, follow_redirects=True) as c:
         r = await c.get(f"https://rdap.org/domain/{domain}", headers={"Accept": "application/rdap+json"})
         if r.status_code != 200: return None
         d = r.json()
@@ -105,7 +108,7 @@ async def rdap_lookup(domain: str) -> dict | None:
 
 
 async def github_lookup(handle: str) -> dict | None:
-    async with httpx.AsyncClient(timeout=15) as c:
+    async with httpx.AsyncClient(verify=shared_ssl(), timeout=15) as c:
         r = await c.get(f"https://api.github.com/users/{handle}", headers={"Accept": "application/vnd.github+json"})
         if r.status_code != 200: return None
         d = r.json()
@@ -116,7 +119,7 @@ async def github_lookup(handle: str) -> dict | None:
 async def hunter_lookup(domain: str) -> dict | None:
     key = os.getenv("HUNTER_API_KEY")
     if not key: return None
-    async with httpx.AsyncClient(timeout=30) as c:
+    async with httpx.AsyncClient(verify=shared_ssl(), timeout=30) as c:
         r = await c.get("https://api.hunter.io/v2/domain-search", params={"domain": domain, "api_key": key, "limit": 25})
         r.raise_for_status(); d = r.json().get("data", {})
     return {"pattern": d.get("pattern"), "organization": d.get("organization"),
@@ -211,7 +214,7 @@ def lead_score(profile: dict) -> dict:
 
 
 # ---------------------------------------------------------------- orchestrator
-async def enrich_job(job: dict, progress=None, use_ai: bool = True) -> dict:
+async def enrich_job(job: dict, progress=None, use_ai: bool = True, use_registry: bool = True) -> dict:
     t0 = time.perf_counter()
     def step(msg):
         if progress: progress(msg)
@@ -219,6 +222,10 @@ async def enrich_job(job: dict, progress=None, use_ai: bool = True) -> dict:
     region = TLD_REGION.get(dom.rsplit(".", 1)[-1])
     errors = {}
     company = {k: _val(v) for k, v in fields.items()}
+    # Local-format numbers ("(042) 3749...") need a country: try the TLD, then countries named in the addresses.
+    loc_text = " ".join(company.get("locations") or []) if isinstance(company.get("locations"), list) else str(company.get("locations") or "")
+    regions = [region] + [code for rx, code in COUNTRY_HINTS if re.search(rx, loc_text, re.I)]
+    regions = list(dict.fromkeys(r for r in regions if r)) or [None]
 
     step("DNS, RDAP and provider lookups")
     async def safe(name, coro):
@@ -231,6 +238,13 @@ async def enrich_job(job: dict, progress=None, use_ai: bool = True) -> dict:
     dns_info, rdap, hunter, gh = await asyncio.gather(
         safe("dns", dns_lookup(dom)), safe("rdap", rdap_lookup(dom)), safe("hunter", hunter_lookup(dom)),
         safe("github", github_lookup(github_handle)) if github_handle else asyncio.sleep(0, None))
+    registry = None
+    if use_registry:
+        step("Company registry")
+        try:
+            registry, reg_errors = await registries.match(str(company.get("company_name") or ""), regions[0], dom)
+            errors.update(reg_errors)
+        except Exception as e: errors["registry"] = f"{type(e).__name__}: {e}"[:300]
 
     step("Contacts and people")
     emails = []
@@ -247,10 +261,6 @@ async def enrich_job(job: dict, progress=None, use_ai: bool = True) -> dict:
     phones_raw = []
     for p in pages.values(): phones_raw.extend(p.get("phones", []))
     if company.get("phone"): phones_raw.insert(0, company["phone"])
-    # Local-format numbers ("(042) 3749...") need a country: try the TLD, then countries named in the addresses.
-    loc_text = " ".join(company.get("locations") or []) if isinstance(company.get("locations"), list) else str(company.get("locations") or "")
-    regions = [region] + [code for rx, code in COUNTRY_HINTS if re.search(rx, loc_text, re.I)]
-    regions = list(dict.fromkeys(r for r in regions if r)) or [None]
     phone_rows, seen = [], set()
     for ph in phones_raw:
         r = next((x for x in (parse_phone(ph, rg) for rg in regions) if x["valid"]), None) or parse_phone(ph, regions[0])
@@ -272,8 +282,15 @@ async def enrich_job(job: dict, progress=None, use_ai: bool = True) -> dict:
     for e in (hunter or {}).get("emails", []):
         if e.get("name") and e["name"].lower() not in seen:
             seen.add(e["name"].lower()); people.append({"name": e["name"], "title": e.get("title"), "email": e["email"], "source": "hunter", "linkedin": e.get("linkedin")})
+    # Current officers (directors, secretaries…) filed with the company register.
+    for o in [o for o in (registry or {}).get("officers", []) if o.get("current")][:15]:
+        name = o["name"]
+        if not name or name.lower() in seen: continue
+        seen.add(name.lower())
+        people.append({"name": name, "title": (o.get("position") or "officer").title(), "source": registry.get("source") or "registry", "source_url": o.get("record_url") or o.get("opencorporates_url"),
+                       "context": "registry officer", "since": o.get("start_date")})
     rank = lambda t: 0 if re.search(r"\bceo\b|chief executive|founder|owner|president|managing director", t or "", re.I) else 1 if re.search(r"\bc[a-z]o\b|chief|vp|vice president|head|director", t or "", re.I) else 2
-    ctx_rank = {"team": 0, "website": 1, None: 1, "mentioned (possibly a client)": 3}
+    ctx_rank = {"team": 0, "registry officer": 0, "website": 1, None: 1, "mentioned (possibly a client)": 3}
     people.sort(key=lambda p: (ctx_rank.get(p.get("context"), 1), rank(p.get("title"))))
     pattern = (hunter or {}).get("pattern") or infer_pattern(people, emails, dom)  # Hunter uses the same "{first}.{last}" notation
     # Only guess addresses for people we are confident work here: a team/leadership page, or any
@@ -282,7 +299,7 @@ async def enrich_job(job: dict, progress=None, use_ai: bool = True) -> dict:
     for p in people:
         f, l = _name_parts(p["name"])
         found = next((e for e in emails if f and e.endswith("@" + dom) and any(fn(f, l) == e.split("@")[0] for fn in PATTERNS.values())), None)
-        guessable = p.get("context") == "team" or (p.get("context") == "website" and not has_team)
+        guessable = p.get("context") in ("team", "registry officer") or (p.get("context") == "website" and not has_team)
         if found and not p.get("email"): p["email"] = found; p["email_source"] = "website"
         elif not p.get("email") and f and mx_ok.get(dom) and guessable:
             if pattern and pattern in PATTERNS:
@@ -308,10 +325,20 @@ async def enrich_job(job: dict, progress=None, use_ai: bool = True) -> dict:
     tech_rows = sorted(tech.values(), key=lambda t: (t["category"], t["name"]))
     firmo = firmographics(pages, str(company.get("description") or ""), seed)
     if company.get("locations"): firmo["headquarters"] = (company["locations"][0] if isinstance(company["locations"], list) else company["locations"])
+    if registry:
+        inc = registry.get("incorporation_date")
+        if inc: firmo["incorporation_date"] = inc
+        if inc and not firmo.get("founded_year"):
+            firmo["founded_year"] = int(inc[:4]); firmo["company_age_years"] = time.gmtime().tm_year - int(inc[:4])
+            firmo["evidence"]["founded_year"] = {"text": f"incorporated {inc}", "url": registry.get("record_url") or registry.get("opencorporates_url"), "strength": "company register"}
+        if not firmo.get("headquarters") and registry.get("registered_address"): firmo["headquarters"] = registry["registered_address"]
 
     profile = {"domain_name": dom, "company": company, "dns": dns_info or {}, "domain": rdap, "firmographics": firmo, "tech_stack": tech_rows,
                "contacts": {"emails": email_rows, "phones": phone_rows}, "people": people, "email_pattern": pattern, "social": social,
-               "providers": {"hunter": bool(hunter), "hunter_configured": bool(os.getenv("HUNTER_API_KEY")), "ai": use_ai and ai.configured(), "ai_configured": ai.configured()},
+               "providers": {"hunter": bool(hunter), "hunter_configured": bool(os.getenv("HUNTER_API_KEY")), "ai": use_ai and ai.configured(), "ai_configured": ai.configured(),
+                             "opencorporates": bool(registry) and registry.get("source") == "opencorporates", "opencorporates_configured": oc.configured(),
+                             "registry": bool(registry), "registry_source": (registry or {}).get("source"), "registry_sources_tried": registries.match_order(regions[0]) if use_registry else []},
+               "registry": registry,
                "ai": None, "errors": errors}
 
     if use_ai and ai.configured():
@@ -349,4 +376,9 @@ def flatten(profile: dict | None) -> dict:
         "tech_stack": ", ".join(t["name"] for t in p.get("tech_stack", [])),
         **{f"social_{k}": v.get("url") for k, v in p.get("social", {}).items()},
         "ai_summary": a.get("summary"), "ai_industry": a.get("industry"), "ai_business_model": a.get("business_model"),
+        **({"registry_legal_name": g.get("name"), "registry_company_number": g.get("company_number"), "registry_jurisdiction": g.get("jurisdiction_code"),
+            "registry_status": g.get("current_status"), "registry_company_type": g.get("company_type"), "registry_incorporation_date": g.get("incorporation_date"),
+            "registry_address": g.get("registered_address"), "registry_officers": ", ".join(f"{o['name']} ({o.get('position') or 'officer'})" for o in g.get("officers", []) if o.get("current")),
+            "registry_match_confidence": g.get("match_confidence"), "registry_source": g.get("source"), "registry_lei": g.get("lei"),
+            "registry_record_url": g.get("record_url"), "opencorporates_url": g.get("opencorporates_url")} if (g := p.get("registry")) else {}),
     }

@@ -8,6 +8,7 @@ A local web app for crawling company websites, extracting structured data, and e
 - **Extract** company name, description, CEO/founders, emails, phones, office addresses, services, industries, case studies, certifications and social links. Each value comes with its confidence and source page.
 - **Enrich** with domain age and registrar, mail provider, SPF/DMARC, email deliverability, normalised phone numbers, decision makers with email patterns, founded year, headcount, tech stack and a 0–100 lead score.
 - **Handle access**: detects CAPTCHAs, bot walls and login pages, and saves logged-in sessions as auth profiles. Also supports proxy rotation, request delays and robots.txt.
+- **Company registries**: every crawl is matched to its official record (legal name, company number, status, incorporation date, registered address and, where the source has them, current directors). You can also search a registry or paste a list of names for a bulk lookup, and export the lists. Sources: **GLEIF** (worldwide, free, no key), **UK Companies House** (free key, includes directors) and **OpenCorporates** (token).
 - **Export** to CSV, XLSX (one sheet each for company, people, emails, phones, tech stack and pages) and JSON. Crawl history is kept in SQLite.
 
 ---
@@ -77,6 +78,9 @@ python main.py
 | `AI_API_KEY` | *(empty)* | Optional. Any OpenAI-compatible key. Adds industry, summary, business model, target customers and offerings. |
 | `AI_BASE_URL` / `AI_MODEL` | OpenAI / `gpt-4.1-mini` | Endpoint and model for the AI step. |
 | `HUNTER_API_KEY` | *(empty)* | Optional. Hunter.io key for verified staff emails. |
+| `COMPANIES_HOUSE_API_KEY` | *(empty)* | Optional, free. UK Companies House REST API key: UK companies with directors. |
+| `OPENCORPORATES_API_TOKEN` | *(empty)* | Optional. OpenCorporates API token (paid for commercial use). |
+| `OPENCORPORATES_MIN_INTERVAL` | `1.0` | Seconds between OpenCorporates API calls. |
 | `PLAYWRIGHT_BROWSERS_PATH` | *(unset)* | Optional. Where browsers are installed. Set it **before** `scrapling install` if your system drive is short on space, e.g. `D:/scrapling/browsers`. |
 
 Restart the app after editing `.env`.
@@ -85,10 +89,31 @@ Restart the app after editing `.env`.
 
 ## Using the app
 
-1. Enter a company URL and click **Start crawl**. Auto mode and 20 pages at depth 2 are a good default.
-2. Watch the **Crawl activity** list. The mode column shows whether each page used HTTP, a browser or the stealth browser.
-3. When it finishes, the **Enriched profile** tab shows the lead score, company facts, domain and email setup, people, verified contacts, tech stack and social profiles. **Extracted fields** shows the raw values with confidence and source.
-4. Export with **XLSX / CSV / JSON**, or reopen past crawls from **History**. **Re-run enrichment** refreshes an old crawl.
+### Find companies (main feature)
+
+1. Type any **Industry** (textile, medicine, software, steel... any word) and a **Country** (`pk`, `Pakistan`, `UK`). Company name is optional.
+2. Click **Find companies**. The app reads the open **Overture Maps** places data (no key, no account) and lists the companies whose category or name matches your words, best contact details first. **How many** (25 to 200, default 50) keeps the list manageable.
+3. It then opens every company website by itself and collects emails, phones, people, social links, tech and a lead score (the same as *Crawl one website*). The progress bar shows `done / total`.
+4. Click **Download Excel**: sheet **Summary** (one row per company, each row links to its own sheet), then **one sheet per company** (all details, people, emails, phones), then **Sources**. CSV is also available. The table shows 25 rows at a time (*Show next 25*).
+
+No per-industry lists exist: your words are matched against Overture's category path (for example `manufacturing_and_industrial > textile_manufacturer`) and the company name, using the first five letters of longer words so `medicine` also finds `medical`. Coverage is what Overture holds: in a measured run for Pakistan, "textile" matched 642 companies, "software" 2,323 and "medicine" 4,818, and most of the top results have a website and an email. It is broad, not a complete official register.
+
+A few related categories widen common words (for example "software" also finds `information_technology_company`, "textile" also finds spinning, weaving and apparel manufacturers); after that change "textile" matched 1,473 and "software" 2,751 for Pakistan. Branches that share a website are merged into one company (the `locations` column counts them), and bigger companies (more locations, a legal name such as Ltd / Pvt) rank higher.
+
+The first search for a country downloads that country's part of the public Overture files once (about 45 seconds for Pakistan, 34 MB in `data/overture/<release>/`); later searches for that country read the local copy in under a second, and a new Overture release is fetched automatically. Set `OVERTURE_CACHE=0` to always read Overture directly (capped by `OVERTURE_SCAN_SECONDS`, default 300). Website crawls run 8 at a time (`COMPANY_CRAWL_CONCURRENCY`) with a 25 s cap per page and 45 s per site (`COMPANY_PAGE_SECONDS`, `COMPANY_SITE_SECONDS`); 100 textile companies in Pakistan took about 3 minutes in a measured run. Set `OVERTURE_RELEASE` to pin a release. A company name without a country searches the official LEI register (GLEIF).
+
+Only public company websites are read, robots.txt is respected, and companies without a website keep the phone and email that Overture lists. Data licence: (c) Overture Maps Foundation, CDLA Permissive 2.0.
+
+### Crawl one website
+
+1. Enter a company URL and click **Start crawl** (open *Crawl options* to change the mode, pages or depth).
+2. Watch the **Crawl activity** list.
+3. When it finishes, the **Enriched profile** tab shows the lead score, company facts, domain and email setup, people, verified contacts, tech stack and social profiles.
+4. Export with **XLSX / CSV / JSON**, or reopen past crawls from **History**.
+
+### Company registries during a crawl
+
+Keep *Company registry lookup* ticked when you crawl. Enrichment tries Companies House first for UK sites (needs a free `COMPANIES_HOUSE_API_KEY`), then OpenCorporates (needs a paid `OPENCORPORATES_API_TOKEN`), then **GLEIF** (free, no key), and adds a *Company registry* card and `registry_*` columns. A bad key or a rate limit stops that source instead of retrying.
 
 ### Blocked sites, CAPTCHAs and logins
 
@@ -135,6 +160,11 @@ scraper/
   auth.py             Auth profiles and the interactive login browser
   security.py         Password login, private-address guard, local-only actions
   ai.py               Optional OpenAI-compatible client
+  overture.py         Industry + country company lists from Overture Maps (open data), countries.json
+  registries.py       Company-registry sources for crawl enrichment
+  gleif.py            GLEIF LEI API client (free, no key)
+  companieshouse.py   UK Companies House API client (free key): search, profile, officers
+  opencorporates.py   OpenCorporates API client: search, company + officers, name matching
   db.py, models.py, urltools.py
 static/               Web UI (index.html, app.js, app.css)
 setup.bat / setup.sh  One-time setup
@@ -145,6 +175,15 @@ share.bat / share.ps1 Start the app with a public link (Windows)
 `data/`, `.env` and `.venv/` are created locally and are not committed.
 
 ---
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The registry tests use recorded API responses, so they need no token or network.
 
 ## Troubleshooting
 
@@ -157,6 +196,9 @@ share.bat / share.ps1 Start the app with a public link (Windows)
 | Pages skipped with "Disallowed by robots.txt" | The site asks crawlers not to fetch them. Untick **Respect robots.txt** only if you have permission. |
 | Enrichment shows no mail provider / DNS data | DNS lookups use DNS-over-HTTPS (Cloudflare, Google). Check that the machine can reach them. |
 | `share.bat` says it could not get a tunnel | Cloudflare's free tunnel service is occasionally slow. Wait a minute and run it again. |
+| A registry source is greyed out ("not configured") | Add its key (`COMPANIES_HOUSE_API_KEY` or `OPENCORPORATES_API_TOKEN`) to `.env` and restart. GLEIF needs no key. |
+| Companies House error 401 | Use a **REST** API key (not a stream key) from your Companies House application. |
+| Rate limit (GLEIF 429, Companies House 429, OpenCorporates 403) | Wait for the window to reset (1 minute, 5 minutes, or midnight UTC for OpenCorporates) and run it again. |
 | Port 8000 already in use | Set `PORT=8001` in `.env`, or stop the other process. |
 
 ## Responsible use

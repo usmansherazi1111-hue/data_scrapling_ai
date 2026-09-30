@@ -14,3 +14,7 @@ __pycache__/
 *.log
 .DS_Store
 Thumbs.db
+
+# Archives and test cache
+*.zip
+.pytest_cache/

@@ -97,14 +97,17 @@ class CrawlEngine:
                 if challenge:
                     return item, PageRecord(url=url, status=getattr(response, "status", None), title="", mode=used_label, elapsed_ms=elapsed, discovered_score=score, category=cat,
                                             challenge=challenge, error=CHALLENGE_HELP.format(challenge)), None, None, [], challenge
-                extracted = extract_page(response, url, cat)
-                links = discover(response, seed, max_pages * 2)
-                html = page_html(response)
+                def parse():
+                    html = page_html(response)
+                    return extract_page(response, url, cat), discover(response, seed, max_pages * 2), techdetect.detect(response, html)
+                # Parsing runs off the event loop so other sites keep downloading meanwhile.
+                extracted, links, tech = await asyncio.to_thread(parse) if cfg.get("parse_in_thread") else parse()
                 raw = {"url": url, "category": cat, "status":getattr(response, "status", None), "title": extracted.get("title", ""), "markdown": "", "text": extracted.get("text", ""),
                        "jsonld": extracted.get("jsonld", []), "emails": extracted.get("emails", []), "phones": extracted.get("phones", []), "headings": extracted.get("headings", []),
-                       "people": extracted.get("people", []), "addresses": extracted.get("addresses", []), "tech": techdetect.detect(response, html), "xhr": []}
-                try: raw["markdown"] = response.markdown(main_content_only=True)
-                except Exception: pass
+                       "people": extracted.get("people", []), "addresses": extracted.get("addresses", []), "tech": tech, "xhr": []}
+                if cfg.get("markdown", True):   # markdownify is slow and company-list crawls never show it
+                    try: raw["markdown"] = response.markdown(main_content_only=True)
+                    except Exception: pass
                 xhr = getattr(response, "captured_xhr", []) or []
                 if capture_xhr:
                     for x in xhr[:30]:
@@ -116,14 +119,24 @@ class CrawlEngine:
             except Exception as e:
                 return item, PageRecord(url=url, status=None, title="", mode=mode, elapsed_ms=int((time.perf_counter() - t) * 1000), discovered_score=score, category=cat, error=str(e)[:500]), None, None, [], str(e)
 
+        page_cap = float(cfg.get("page_time_limit") or 0); budget = float(cfg.get("time_budget") or 0)
+
+        async def one_capped(item):
+            # Hard stop per page so one slow or protected site cannot hold a worker for minutes.
+            if not page_cap: return await one(item)
+            try: return await asyncio.wait_for(one(item), page_cap)
+            except asyncio.TimeoutError:
+                url, _, cat, score = item; msg = f"timed out after {page_cap:g} s"
+                return item, PageRecord(url=url, status=None, title="", mode=mode, elapsed_ms=int(page_cap * 1000), discovered_score=score, category=cat, error=msg), None, None, [], msg
+
         try:
-            while queue and len(visited) < max_pages:
+            while queue and len(visited) < max_pages and not (budget and time.perf_counter() - started > budget):
                 batch = []
                 while queue and len(batch) < int(cfg.get("concurrency", 4)) and len(visited) + len(batch) < max_pages:
                     item = queue.popleft()
                     if item[0] not in visited: batch.append(item)
                 if not batch: continue
-                for item, record, raw, extracted, links, error in await asyncio.gather(*(one(x) for x in batch)):
+                for item, record, raw, extracted, links, error in await asyncio.gather(*(one_capped(x) for x in batch)):
                     visited.add(item[0]); result.pages.append(record)
                     if raw:
                         result.raw_pages[item[0]] = raw; page_payload.append({"url": item[0], "category": item[2], "extracted": extracted})
@@ -141,7 +154,7 @@ class CrawlEngine:
                                  "pages_blocked": sum(1 for p in result.pages if p.challenge), "elapsed_ms": int((time.perf_counter() - started) * 1000), "queue_remaining": len(queue),
                                  "profile": cfg.get("profile"), "proxies": len(proxies)})
             if cfg.get("enrich", True) and page_payload:
-                await self.enrich(job_id, result=result, use_ai=cfg.get("ai_enrichment", True))
+                await self.enrich(job_id, result=result, use_ai=cfg.get("ai_enrichment", True), use_registry=cfg.get("registry_lookup", True))
             result.status = "completed"; result.finished_at = now_iso(); self.db.save(result); return result
         except Exception as e:
             result.status = "failed"; result.stats["error"] = str(e)[:1000]; result.finished_at = now_iso(); self.db.save(result); return result
@@ -150,7 +163,7 @@ class CrawlEngine:
                 try: await s.close()
                 except Exception: pass
 
-    async def enrich(self, job_id, result=None, use_ai=True):
+    async def enrich(self, job_id, result=None, use_ai=True, use_registry=True):
         """Run (or re-run) enrichment for a live CrawlResult or a job stored in history."""
         target = result or self.jobs.get(job_id)
         data = target.jsonable() if hasattr(target, "jsonable") else (target or self.db.get(job_id))
@@ -162,7 +175,7 @@ class CrawlEngine:
         set_state(state)
         if not hasattr(target, "jsonable"): self.jobs[job_id] = data
         try:
-            profile = await enrich_job(data, progress=lambda s: state.update(step=s), use_ai=use_ai)
+            profile = await enrich_job(data, progress=lambda s: state.update(step=s), use_ai=use_ai, use_registry=use_registry)
             profile["status"] = "done"
         except Exception as e:
             profile = {"status": "failed", "error": f"{type(e).__name__}: {e}"[:500]}

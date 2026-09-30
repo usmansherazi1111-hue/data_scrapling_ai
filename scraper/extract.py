@@ -26,9 +26,35 @@ def clean(v):
     return re.sub(r"\s+", " ", str(v)).strip()
 
 
+MOJIBAKE_RE = re.compile(r"[ÃÂâ][\x80-\xbf€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ]")
+
+
+def _cp1252_bytes(line):
+    # cp1252 leaves 0x81/0x8d/0x8f/0x90/0x9d undefined; those arrive as raw C1 chars or lone surrogates.
+    out=bytearray()
+    for ch in line:
+        o=ord(ch)
+        if 0xDC80<=o<=0xDCFF: out.append(o-0xDC00)
+        elif o<0x100 and not 0x80<=o<=0x9f or o in (0x81,0x8d,0x8f,0x90,0x9d): out.append(o)
+        else: out+=ch.encode("cp1252")
+    return bytes(out)
+
+
+def fix_mojibake(s):
+    """Undo UTF-8 text that was decoded as cp1252 ("â€œ" -> "“"); leaves normal text alone."""
+    if not s or not MOJIBAKE_RE.search(s): return s
+    out=[]
+    for line in s.split("\n"):
+        if MOJIBAKE_RE.search(line):
+            try: line=_cp1252_bytes(line).decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError): pass
+        out.append(line)
+    return "\n".join(out)
+
+
 def raw_text(response):
     try:
-        return str(response.get_all_text(separator="\n", strip=True, valid_values=True))
+        return fix_mojibake(str(response.get_all_text(separator="\n", strip=True, valid_values=True)))
     except Exception:
         return ""
 
@@ -95,22 +121,35 @@ CERT_RE = re.compile(r"\b(ISO(?:/IEC)?\s?\d{4,5}(?::\d{4})?|SOC\s?[12](?:\s?Type
                      r"(?:AWS|Microsoft|Google Cloud|Salesforce|Shopify|HubSpot|Odoo|Oracle|SAP)\s(?:Advanced|Select|Premier|Gold|Silver|Certified|Registered|Consulting)?\s?(?:Tier\s)?(?:Consulting\s|Services\s|Solutions\s)?Partner)\b", re.I)
 
 
+NOT_NAME_WORDS = {"download","company","profile","celebration","celebrations","birthday","message","activity","activities","news","events","event",
+    "welcome","contact","about","read","view","team","board","group","limited","ltd","pvt","private","industries","mills","textile","textiles",
+    "products","services","home","our","the","of","and","vision","mission","history","overview","corporate","annual","report","gallery","career","careers","happy","christmas","eid","holiday","us",
+    "apply","now","click","here","learn","more","get","started","join","watch","listen","explore","book","shop","order","buy","sign","login",
+    "register","subscribe","follow","share","latest","new","exclusive","podcast","interview","quote","request","free","trial","demo"}
+NOT_TITLE_RE = re.compile(r"[\"“”«»]|\b(message|messages|activity|speech|desk|note|profile|if i were)\b|'s\b|’s\b", re.I)
+
+
+def looks_like_name(s):
+    return bool(NAME_RE.match(s)) and not any(w.lower().strip(".") in NOT_NAME_WORDS for w in s.split())
+
+
 def people_in(raw_text):
     """Find (name, title) pairs where a role line sits right after/before a name-shaped line."""
     lines=[clean(l) for l in raw_text.splitlines() if clean(l)]
     out=[]
     for i,l in enumerate(lines):
-        if len(l)>80 or not ROLE_RE.search(l): continue
+        if len(l)>80 or not ROLE_RE.search(l) or NOT_TITLE_RE.search(l): continue
         m=re.match(r"^(.{3,40}?)\s*[,|–—-]\s*(.+)$", l)
-        if m and NAME_RE.match(m.group(1)) and ROLE_RE.search(m.group(2)):
+        if m and looks_like_name(m.group(1)) and ROLE_RE.search(m.group(2)):
             out.append((m.group(1),m.group(2))); continue
         # Some sites split first/last name into separate elements ("Bilal" / "Mahmood" / "Managing Director").
-        if i>=2 and re.fullmatch(r"[A-Z][\w'’.-]+",lines[i-1]) and re.fullmatch(r"[A-Z][\w'’.-]+",lines[i-2]):
+        if i>=2 and re.fullmatch(r"[A-Z][\w'’.-]+",lines[i-1]) and re.fullmatch(r"[A-Z][\w'’.-]+",lines[i-2]) and looks_like_name(f"{lines[i-2]} {lines[i-1]}"):
             out.append((f"{lines[i-2]} {lines[i-1]}",l)); continue
         for j in (i-1,i+1):
-            if 0<=j<len(lines) and len(lines[j])<=40 and NAME_RE.match(lines[j]) and not ROLE_RE.search(lines[j]):
+            if 0<=j<len(lines) and len(lines[j])<=40 and looks_like_name(lines[j]) and not ROLE_RE.search(lines[j]):
                 out.append((lines[j],l)); break
-    return out
+    # Titles often start with a bullet or a broken character ("� CEO."); keep the words only.
+    return [(n, t.strip(" �•·–—-|:,.")) for n, t in out]
 
 
 ADDRESS_HINT = re.compile(r"\b(floor|suite|road|rd|street|st|avenue|ave|block|tower|towers|building|plaza|centre|center|blvd|boulevard|drive|dr|lane|highway|sector|p\.?o\.? box)\b\.?", re.I)

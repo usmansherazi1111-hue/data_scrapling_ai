@@ -37,7 +37,7 @@ async function start() {
   const body = {
     url, mode: $('mode').value, max_pages: +$('max_pages').value, depth: +$('depth').value, concurrency: +$('concurrency').value,
     browser_pages: +$('browser_pages').value, timeout: +$('timeout').value, adaptive: $('adaptive').checked, network_idle: $('network_idle').checked,
-    disable_resources: $('disable_resources').checked, capture_xhr: $('capture_xhr').checked, ai_enrichment: $('ai').checked, enrich: $('enrich').checked,
+    disable_resources: $('disable_resources').checked, capture_xhr: $('capture_xhr').checked, ai_enrichment: $('ai').checked, registry_lookup: $('registry_lookup').checked, enrich: $('enrich').checked,
     escalate: $('escalate').checked, respect_robots: $('respect_robots').checked, delay_ms: +$('delay_ms').value, proxies: $('proxies').value,
     profile: $('profile').value || null,
   };
@@ -156,14 +156,29 @@ function renderEnriched(d) {
   if (a) aiCard = card('AI analysis', `${a.summary ? `<p>${esc(a.summary)}</p>` : ''}${kv([['Industry', a.industry], ['Sub-industries', a.sub_industries], ['Business model', a.business_model], ['Target customers', a.target_customers], ['Key offerings', a.key_offerings], ['Notable clients', a.notable_clients], ['Value proposition', a.value_proposition], ['Size estimate', a.company_size_estimate], ['Competitors mentioned', a.competitors_mentioned]])}`, 'wide');
   else aiCard = card('AI analysis', `<p class="muted">${e.providers?.ai_configured ? 'AI analysis was switched off for this run.' : 'Not configured. Add <code>AI_API_KEY</code> (any OpenAI-compatible endpoint) to <code>.env</code> and restart to get an industry, summary, target customers and offerings.'}</p>`, 'wide');
 
+  const g = e.registry;
+  let registryCard;
+  if (g) {
+    const officers = (g.officers || []).filter(o => o.current);
+    registryCard = card(`Company registry <small class="muted">${esc(SRC_NAMES[g.source] || 'OpenCorporates')} · match ${Math.round((g.match_confidence || 0) * 100)}%</small>`, kv([
+      ['Legal name', g.name], ['Company number', g.company_number], ...(g.lei ? [['LEI', g.lei]] : []), ['Jurisdiction', g.jurisdiction_code], ['Status', g.current_status], ['Type', g.company_type],
+      ['Incorporated', g.incorporation_date], ['Registered address', g.registered_address], ['Industry codes', g.industry_codes], ['Previous names', g.previous_names],
+      ['Current officers', officers.length ? H(officers.map(o => `${esc(o.name)} <small class="muted">${esc(o.position || '')}${o.start_date ? ' · since ' + esc(o.start_date) : ''}</small>`).join('<br>')) : null],
+      ['Parent company', g.controlling_company?.name],
+    ]) + `<p class="muted small">${attribution(g)}${g.source_publisher && g.source !== 'gleif' ? ' · register: ' + esc(g.source_publisher) : ''}${g.registry_url && g.registry_url !== g.record_url ? ' · ' + link(g.registry_url, 'official record') : ''}</p>`, 'wide');
+  } else {
+    const tried = (e.providers?.registry_sources_tried || []).map(x => SRC_NAMES[x] || x).join(', ');
+    registryCard = card('Company registry', `<p class="muted">${tried ? `No confident match for this company name in ${esc(tried)}.` : 'The registry lookup was switched off for this run.'}${e.providers?.opencorporates_configured || tried.includes('Companies House') ? '' : ' UK companies: add a free <code>COMPANIES_HOUSE_API_KEY</code> to <code>.env</code> to get directors.'}</p>`, 'wide');
+  }
+
   const errs = Object.entries(e.errors || {});
-  const provider = `<p class="muted small">Sources: website crawl, DNS-over-HTTPS, RDAP registry, phone metadata${e.providers?.hunter ? ', Hunter.io' : e.providers?.hunter_configured ? '' : ' · add <code>HUNTER_API_KEY</code> for verified staff emails'}${e.providers?.ai ? ', LLM' : ''} · enriched in ${((e.elapsed_ms || 0) / 1000).toFixed(1)}s${errs.length ? ' · <span class="err">' + errs.map(([k, v]) => esc(k + ': ' + v)).join('; ') + '</span>' : ''}</p>`;
-  box.innerHTML = `<div class="egrid">${scoreCard}${companyCard}${domainCard}${peopleCard}${contactsCard}${techCard}${socialCard}${aiCard}</div>${provider}`;
+  const provider = `<p class="muted small">Sources: website crawl, DNS-over-HTTPS, RDAP registry, phone metadata${e.providers?.hunter ? ', Hunter.io' : e.providers?.hunter_configured ? '' : ' · add <code>HUNTER_API_KEY</code> for verified staff emails'}${e.providers?.ai ? ', LLM' : ''}${e.providers?.registry ? ', ' + esc(SRC_NAMES[e.providers.registry_source] || 'registry') : ''} · enriched in ${((e.elapsed_ms || 0) / 1000).toFixed(1)}s${errs.length ? ' · <span class="err">' + errs.map(([k, v]) => esc(k + ': ' + v)).join('; ') + '</span>' : ''}</p>`;
+  box.innerHTML = `<div class="egrid">${scoreCard}${companyCard}${domainCard}${peopleCard}${contactsCard}${techCard}${socialCard}${registryCard}${aiCard}</div>${provider}`;
 }
 
 async function runEnrichment() {
   try {
-    await api(`/api/jobs/${currentJob}/enrich?ai_enrichment=${$('ai').checked}`, {method: 'POST'});
+    await api(`/api/jobs/${currentJob}/enrich?ai_enrichment=${$('ai').checked}&registry_lookup=${$('registry_lookup').checked}`, {method: 'POST'});
     $('progress').classList.remove('hidden'); poll();
   } catch (e) { alert(e.message); }
 }
@@ -223,7 +238,58 @@ async function saveCookies() {
   catch (e) { alert(e.message); }
 }
 
-// ------------------------------------------------------------------ wiring
+// ------------------------------------------------------------------ company registries (GLEIF, Companies House, OpenCorporates)
+const SRC_NAMES = {gleif: 'GLEIF', companieshouse: 'Companies House', opencorporates: 'OpenCorporates', directory: 'OpenStreetMap + Wikidata', osm: 'OpenStreetMap', wikidata: 'Wikidata'};
+// ------------------------------------------------------------------ find companies: industry + country -> list -> automatic crawl -> Excel
+let fcId = null, fcTimer = null, fcShown = 25;
+const fcSite = c => c.website ? link(/^https?:/i.test(c.website) ? c.website : 'http://' + c.website, c.website.replace(/^https?:\/\/(www\.)?/i, '').replace(/\/$/, '').slice(0, 40)) : '<span class="muted">no website listed</span>';
+function fcDetails(c) {
+  const d = c.details || {}, out = [];
+  if (d.decision_maker) out.push(`${esc(d.decision_maker)}${d.decision_maker_title ? ' (' + esc(d.decision_maker_title) + ')' : ''}`);
+  const emails = (d.all_emails || '').split(',').map(x => x.trim()).filter(Boolean);
+  if (emails.length) out.push('✉ ' + esc(emails.slice(0, 3).join(', ')) + (emails.length > 3 ? ` +${emails.length - 3}` : ''));
+  if (d.phones_e164) out.push('☎ ' + esc(d.phones_e164.split(',')[0]));
+  const soc = Object.keys(d).filter(k => k.startsWith('social_')).map(k => link(d[k], k.slice(7)));
+  if (soc.length) out.push(soc.join(' · '));
+  if (d.lead_score != null) out.push(`score ${esc(d.lead_score)}${d.lead_grade ? ' (' + esc(d.lead_grade) + ')' : ''}`);
+  return out.join('<br>');
+}
+async function fcSearch() {
+  const body = {industry: $('fcInd').value.trim(), country: $('fcCountry').value.trim(), name: $('fcName').value.trim(), limit: +$('fcLimit').value};
+  try { fcId = (await api('/api/companies/search', {method: 'POST', body: JSON.stringify(body)})).id; fcShown = 25; fcPoll(); } catch (e) { alert(e.message); }
+}
+async function fcPoll() {
+  clearTimeout(fcTimer);
+  const r = await api('/api/companies/' + fcId);
+  fcRender(r);
+  if (r.status === 'running' || r.crawl?.status === 'running') fcTimer = setTimeout(fcPoll, 2000); else fcLoadLists();
+}
+function fcRender(r) {
+  $('fcResult').classList.remove('hidden');
+  const cs = r.companies, cr = r.crawl || {}, n = cs.length;
+  $('fcTitle').textContent = r.label;
+  $('fcNotes').innerHTML = (r.notes || []).map(x => `<p class="muted small">${esc(x)}</p>`).join('') + (r.error ? `<p class="err small">${esc(r.error)}</p>` : '');
+  const crawling = cr.status === 'running';
+  $('fcProgress').innerHTML = r.status === 'running' ? `<span class="spinner"></span> ${esc(r.progress)}`
+    : crawling ? `<span class="spinner"></span> Getting emails, phones, people and social links from each website: ${cr.done} of ${cr.total}${cr.current ? ' (' + esc(cr.current) + ')' : ''}`
+    : `${n} companies` + (cr.total ? ` · ${cr.done - cr.failed} websites crawled${cr.failed ? `, ${cr.failed} could not be read` : ''}` : '');
+  $('fcBar').style.width = cr.total ? Math.round(100 * cr.done / cr.total) + '%' : '0%';
+  $('fcExports').classList.toggle('hidden', !n);
+  for (const k of ['Xlsx', 'Csv']) $('fc' + k).href = `/api/companies/${r.id}/export/${k.toLowerCase()}`;
+  $('fcRows').innerHTML = cs.slice(0, fcShown).map((c, i) => `<tr><td>${i + 1}</td>
+    <td><b>${esc(c.name)}</b><br><small class="muted">${esc([c.category, c.city].filter(Boolean).join(' · '))}</small></td>
+    <td><small>${fcSite(c)}${c.phone ? `<br>${esc(c.phone)}` : ''}${c.email ? `<br>${esc(c.email)}` : ''}</small></td>
+    <td><small>${fcDetails(c)}${c.crawl_status === 'running' ? '<span class="spinner"></span>' : c.crawl_status === 'failed' ? `<span class="err">${esc(c.crawl_error || 'website could not be read')}</span>` : ''}</small></td>
+    <td class="btns">${c.job_id && c.crawl_status === 'completed' ? `<button class="ghost" onclick="openJob('${esc(c.job_id)}')">Full profile</button>` : ''}</td></tr>`).join('');
+  $('fcMore').classList.toggle('hidden', fcShown >= n);
+  $('fcMore').textContent = `Show next 25 (${n - fcShown} more)`;
+  $('fcAttribution').textContent = (cs[0]?.source === 'gleif') ? 'GLEIF LEI data: CC0.' : 'Company data: (c) Overture Maps Foundation, CDLA Permissive 2.0.';
+}
+async function fcLoadLists() {
+  const rows = await api('/api/companies');
+  $('fcLists').innerHTML = rows.map(x => `<div class="history-row"><small>${esc(x.created_at.replace('T', ' ').slice(0, 19))}</small><b>${esc(x.label)}</b><small>${esc(x.status)} · ${x.count}</small><button class="ghost" onclick="fcOpen('${esc(x.id)}')">Open</button></div>`).join('') || '<p class="muted">No searches yet.</p>';
+}
+async function fcOpen(id) { fcId = id; fcShown = 25; await fcPoll(); $('fcResult').scrollIntoView({behavior: 'smooth', block: 'start'}); }
 document.addEventListener('click', e => {
   if (!e.target.matches('.tab')) return;
   document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
@@ -232,8 +298,10 @@ document.addEventListener('click', e => {
 });
 $('start').onclick = start; $('refresh').onclick = loadHistory; $('refreshProfiles').onclick = loadProfiles;
 $('bOpen').onclick = openBrowser; $('bFinish').onclick = finishBrowser; $('cSave').onclick = saveCookies;
+$('fcSearch').onclick = fcSearch; ['fcInd', 'fcCountry', 'fcName'].forEach(id => $(id).addEventListener('keydown', e => { if (e.key === 'Enter') fcSearch(); })); $('fcMore').onclick = () => { fcShown += 25; fcPoll(); };
 api('/api/status').then(s => {
-  $('providers').innerHTML = `<div class="prov"><span class="${s.ai ? 'ok' : 'nf'}">●</span> AI ${s.ai ? esc(s.ai_model) : 'off'}</div><div class="prov"><span class="${s.hunter ? 'ok' : 'nf'}">●</span> Hunter.io ${s.hunter ? 'on' : 'off'}</div>`;
+  if (s.version) $('appVersion').textContent = 'v' + s.version;
+  $('providers').innerHTML = `<div class="prov"><span class="${s.ai ? 'ok' : 'nf'}">●</span> AI ${s.ai ? esc(s.ai_model) : 'off'}</div><div class="prov"><span class="${s.hunter ? 'ok' : 'nf'}">●</span> Hunter.io ${s.hunter ? 'on' : 'off'}</div>${(s.registries || []).map(x => `<div class="prov"><span class="${x.configured ? 'ok' : 'nf'}">●</span> ${esc(SRC_NAMES[x.id])} ${x.configured ? 'on' : 'off'}</div>`).join('')}`;
   if (!s.ai) $('aiNote').textContent = '(needs AI_API_KEY)';
 });
-loadHistory(); loadProfiles();
+loadHistory(); loadProfiles(); fcLoadLists();

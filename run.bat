@@ -6,5 +6,9 @@ if not exist .venv\Scripts\python.exe (
   pause
   exit /b 1
 )
-start "" http://127.0.0.1:8000
+set PORT=
+for /f "tokens=2 delims==" %%p in ('findstr /b "PORT=" .env 2^>nul') do set PORT=%%p
+if "%PORT%"=="" set PORT=8000
+start "" cmd /c "timeout /t 4 >nul & start http://127.0.0.1:%PORT%"
 .venv\Scripts\python.exe main.py
+pause
