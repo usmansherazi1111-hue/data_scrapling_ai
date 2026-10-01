@@ -80,7 +80,9 @@ def fake_engine(main, monkeypatch, fail=()):
         crawled.append((url, cfg["max_pages"], cfg["registry_lookup"])); return Done(url, not any(f in url for f in fail))
 
     async def public(url): return True
+    async def no_registry(c, cc): return None      # the register lookup would otherwise call GLEIF / OpenCorporates over the network
     monkeypatch.setattr(main.ENGINE, "run", run); monkeypatch.setattr(main.security, "is_public_url", public); monkeypatch.setattr(main, "domain_resolves", public)
+    monkeypatch.setattr(main.gapfill, "registry_fill", no_registry)
     return crawled
 
 
