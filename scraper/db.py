@@ -48,3 +48,13 @@ class HistoryDB:
                 c.execute("UPDATE registry_lists SET status=?, result_json=? WHERE id=?",(d["status"],json.dumps(d,ensure_ascii=False),rid))
             c.commit()
         return len(rows)
+
+    def delete_job(self, job_id):
+        with sqlite3.connect(self.path) as c:
+            n=c.execute("DELETE FROM jobs WHERE id=?",(job_id,)).rowcount; c.commit()
+        return n>0
+
+    def delete_registry(self, list_id):
+        with sqlite3.connect(self.path) as c:
+            n=c.execute("DELETE FROM registry_lists WHERE id=?",(list_id,)).rowcount; c.commit()
+        return n>0

@@ -175,3 +175,73 @@ async def test_register_lookup_is_off_unless_enabled(monkeypatch):
     monkeypatch.setenv("GAPFILL_REGISTRY", "1")
     await gapfill.registry_fill(c, "pk")
     assert calls == ["Acme Ltd"] and c["registry"]["lei"] == "L1"
+
+
+def test_delete_a_search_and_a_crawl(client):
+    rid = client.post("/api/companies/search", json={"industry": "textile", "country": "pk", "limit": 5, "crawl": False}).json()["id"]
+    wait(client, rid)
+    assert client.delete(f"/api/companies/{rid}").json() == {"ok": True}
+    assert client.get(f"/api/companies/{rid}").status_code == 404 and client.get("/api/companies").json() == []
+    assert client.delete(f"/api/companies/{rid}").status_code == 404
+    import main
+    main.DB.save({"job_id": "j1", "started_at": "2026-01-01T00:00:00", "seed_url": "https://x.pk", "status": "completed"})
+    assert [h["id"] for h in client.get("/api/history").json()] == ["j1"]
+    assert client.delete("/api/jobs/j1").json() == {"ok": True} and client.get("/api/history").json() == []
+    assert client.delete("/api/jobs/j1").status_code == 404
+
+
+def test_robots_blocked_site_keeps_listing_contacts_and_is_not_a_failure(client, monkeypatch):
+    import main
+    tried = []
+
+    class Res:
+        def jsonable(self):
+            return {"status": "completed", "stats": {}, "enrichment": None,
+                    "pages": [{"url": "https://x.pk/", "status": None, "challenge": "robots", "error": "Disallowed by robots.txt"}]}
+
+    async def run(job_id, url, cfg): tried.append(url); return Res()
+    async def public(url): return True
+    async def resolves(url): return True
+    monkeypatch.setattr(main.ENGINE, "run", run); monkeypatch.setattr(main.security, "is_public_url", public); monkeypatch.setattr(main, "domain_resolves", resolves)
+    rid = client.post("/api/companies/search", json={"industry": "textile", "country": "pk", "limit": 5}).json()["id"]
+    r = wait(client, rid)
+    with_site = [c for c in r["companies"] if c.get("website")]
+    assert with_site and all(c["crawl_status"] == "blocked by robots.txt" for c in with_site)
+    assert r["crawl"]["failed"] == 0 and len(tried) == len(with_site)         # no alternate-address retries for a robots block
+    assert all(c["best"].get("email") for c in with_site if c.get("email"))     # the listing's own contacts are still reported
+
+
+@pytest.mark.asyncio
+async def test_engine_tries_contact_pages_when_home_page_is_disallowed(monkeypatch):
+    from scraper import engine as engine_mod
+
+    class R:
+        status = 200; captured_xhr = []
+        def get_all_text(self, **k): return "Contact us " * 100
+        def css(self, q):
+            class L(list):
+                def get(self, d=""): return d
+                def getall(self): return []
+            return L()
+        def markdown(self, **k): return ""
+
+    fetched = []
+    async def fake_get(url, **kw):
+        fetched.append(url)
+        if url.endswith("/robots.txt"):
+            class T: status = 200; body = b"User-agent: *\nDisallow: /\nAllow: /contact"
+            return T()
+        return R()
+
+    class DB:
+        def save(self, r): pass
+    monkeypatch.setattr(engine_mod.AsyncFetcher, "get", staticmethod(fake_get))
+    monkeypatch.setattr(engine_mod, "discover", lambda r, seed, n: [])
+    monkeypatch.setattr(engine_mod, "page_html", lambda r: "")
+    monkeypatch.setattr(engine_mod, "extract_page", lambda r, u, c: {"title": "", "text": "x"})
+    monkeypatch.setattr(engine_mod, "aggregate", lambda pages, seed: {})
+    res = await engine_mod.CrawlEngine(DB(), {}, {}).run("j", "https://shop.example.pk/", {"max_pages": 6, "depth": 1, "mode": "http", "respect_robots": True, "enrich": False})
+    urls = {p.url: p for p in res.pages}
+    assert urls["https://shop.example.pk/"].challenge == "robots"                       # the home page itself is never fetched
+    assert urls["https://shop.example.pk/contact"].status == 200 and not urls["https://shop.example.pk/contact"].error                        # the allowed contact page is read
+    assert "https://shop.example.pk/" not in fetched and "https://shop.example.pk/about" not in fetched

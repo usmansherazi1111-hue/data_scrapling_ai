@@ -18,7 +18,7 @@ from scraper import ai, security
 from scraper import opencorporates as oc, registries, overture, gapfill
 from scraper.models import now_iso
 
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 app = FastAPI(title="Scrapling Studio", version=VERSION)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 DB_PATH = os.getenv("DB_PATH", "./data/scrapling.db")
@@ -127,6 +127,15 @@ async def enrich(job_id: str, ai_enrichment: bool = True, registry_lookup: bool 
 
 @app.get("/api/history")
 async def history(): return DB.list()
+
+
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(job_id: str):
+    live = JOBS.get(job_id)
+    if live is not None and getattr(live, "status", None) == "running": raise HTTPException(409, "This crawl is still running")
+    JOBS.pop(job_id, None)
+    if not DB.delete_job(job_id) and live is None: raise HTTPException(404, "Job not found")
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------- auth profiles
@@ -264,7 +273,7 @@ async def process_company(c: dict, cc: str, sem, state, run):
             if not url:
                 c["crawl_status"] = "no website"
             else:
-                tried, error = [], None
+                tried, error, robots_blocked = [], None, False
                 for cand in [url] + gapfill.alt_urls(url):
                     try:
                         if not await security.is_public_url(cand): error = "website is not a public address"; continue
@@ -279,10 +288,15 @@ async def process_company(c: dict, cc: str, sem, state, run):
                         c["profile"] = keep_profile(res.get("enrichment"))
                         if cand != url: c["website"] = cand; c.setdefault("filled_from", {})["website"] = "alternate address"
                         break
+                    if any(p.get("challenge") == "robots" for p in res.get("pages", [])):
+                        # Respected, not worked around: the site asked crawlers to stay away, so only listing and OpenStreetMap contacts are used.
+                        c["crawl_status"] = "blocked by robots.txt"; c["crawl_error"] = "The site's robots.txt asks crawlers not to visit it. Listing contacts are kept."
+                        error = None; robots_blocked = True
+                        break
                     codes = sorted({str(p.get("status") or p.get("error") or "no answer")[:40] for p in res.get("pages", [])})
                     error = "website not readable (" + ", ".join(codes[:3]) + ")"
                     if os.getenv("COMPANY_TRY_ALT_URLS", "1") == "0": break
-                if error:
+                if error and not robots_blocked:
                     c["crawl_status"] = "failed"; c["crawl_error"] = error; state["failed"] += 1
         try: await asyncio.wait_for(registry, 60)
         except Exception: registry.cancel()
@@ -350,6 +364,13 @@ def run_for(list_id):
 
 @app.get("/api/companies/{list_id}")
 async def companies_list(list_id: str): return run_for(list_id)
+
+
+@app.delete("/api/companies/{list_id}")
+async def companies_delete(list_id: str):
+    if list_id in REGISTRY_RUNS: raise HTTPException(409, "This search is still running")
+    if not DB.delete_registry(list_id): raise HTTPException(404, "List not found")
+    return {"ok": True}
 
 
 LICENCES = {"overture": "Overture Maps places: (c) Overture Maps Foundation, CDLA Permissive 2.0. https://overturemaps.org",

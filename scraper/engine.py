@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio, random, time
+from urllib.parse import urljoin
 from collections import deque
 from scrapling.fetchers import AsyncFetcher, AsyncDynamicSession, AsyncStealthySession
 from scrapling.engines.toolbelt.proxy_rotation import ProxyRotator
@@ -118,6 +119,12 @@ class CrawlEngine:
                 return item, rec, raw, extracted, links, None
             except Exception as e:
                 return item, PageRecord(url=url, status=None, title="", mode=mode, elapsed_ms=int((time.perf_counter() - t) * 1000), discovered_score=score, category=cat, error=str(e)[:500]), None, None, [], str(e)
+
+        if robots and cfg.get("robots_fallback_paths", True) and not await robots.allowed(seed):
+            # The home page is off limits to crawlers. Contact pages are often allowed, so try those (each is still checked against robots.txt).
+            for path in ("/contact", "/contact-us", "/about", "/about-us"):
+                u = urljoin(seed, path)
+                if u not in queued: queued.add(u); queue.append((u, depth, "contact", 0.9))
 
         page_cap = float(cfg.get("page_time_limit") or 0); budget = float(cfg.get("time_budget") or 0)
 

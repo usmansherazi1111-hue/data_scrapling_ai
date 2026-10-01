@@ -186,7 +186,15 @@ async function runEnrichment() {
 // ------------------------------------------------------------------ history
 async function loadHistory() {
   const rows = await api('/api/history');
-  $('historyRows').innerHTML = rows.map(x => `<div class="history-row"><small>${esc(x.created_at.replace('T', ' ').slice(0, 19))}</small><b>${esc(x.seed_url)}</b><small>${esc(x.status)}</small><button class="ghost" onclick="openJob('${esc(x.id)}')">Open</button></div>`).join('') || '<p class="muted">No crawls yet.</p>';
+  $('historyRows').innerHTML = rows.map(x => `<div class="history-row"><small>${esc(x.created_at.replace('T', ' ').slice(0, 19))}</small><b>${esc(x.seed_url)}</b><small>${esc(x.status)}</small><button class="ghost" onclick="openJob('${esc(x.id)}')">Open</button><button class="ghost danger" onclick="delJob('${esc(x.id)}')">Delete</button></div>`).join('') || '<p class="muted">No crawls yet.</p>';
+}
+async function delJob(id) {
+  if (!confirm('Delete this crawl from History? This cannot be undone.')) return;
+  try { await api('/api/jobs/' + id, {method: 'DELETE'}); if (currentJob === id) $('results').classList.add('hidden'); loadHistory(); } catch (e) { alert(e.message); }
+}
+async function fcDelete(id) {
+  if (!confirm('Delete this search and its results? This cannot be undone.')) return;
+  try { await api('/api/companies/' + id, {method: 'DELETE'}); if (fcId === id) { clearTimeout(fcTimer); fcId = null; $('fcResult').classList.add('hidden'); } fcLoadLists(); } catch (e) { alert(e.message); }
 }
 async function openJob(id) { currentJob = id; render(await api('/api/jobs/' + id)); $('results').scrollIntoView({behavior: 'smooth'}); }
 
@@ -274,7 +282,7 @@ function fcRender(r) {
   const crawling = cr.status === 'running';
   $('fcProgress').innerHTML = r.status === 'running' ? `<span class="spinner"></span> ${esc(r.progress)}`
     : crawling ? `<span class="spinner"></span> Collecting contact details (website, OpenStreetMap, official register): ${cr.done} of ${cr.total}${cr.current ? ' (' + esc(cr.current) + ')' : ''}`
-    : `${n} companies` + (cr.total ? ` · ${cr.done} companies processed${cr.failed ? `, ${cr.failed} website(s) could not be read` : ''}` : '');
+    : `${n} companies` + (cr.total ? ` · ${cr.done} companies processed${cr.failed ? `, ${cr.failed} website(s) could not be read` : ''}${(r.companies || []).filter(c => c.crawl_status === 'blocked by robots.txt').length ? `, ${(r.companies || []).filter(c => c.crawl_status === 'blocked by robots.txt').length} blocked by robots.txt` : ''}` : '');
   $('fcBar').style.width = cr.total ? Math.round(100 * cr.done / cr.total) + '%' : '0%';
   $('fcExports').classList.toggle('hidden', !n);
   for (const k of ['Xlsx', 'Csv']) $('fc' + k).href = `/api/companies/${r.id}/export/${k.toLowerCase()}`;
@@ -285,7 +293,7 @@ function fcRender(r) {
     return `<tr><td>${i + 1}</td>
     <td><b>${esc(c.name)}</b><br><small class="muted">${esc([c.category, c.city].filter(Boolean).join(' · '))}</small>${c.match && c.match !== 'category' ? `<br><small class="warn">${esc(c.match)}</small>` : ''}</td>
     <td><small>${fcSite(c)}${phone ? `<br>${esc(phone)}${srcTag(c, 'phone')}` : ''}${email ? `<br>${esc(email)}${srcTag(c, 'email')}` : ''}${miss.length ? `<br><span class="muted">missing: ${esc(miss.join(', '))}</span>` : ''}</small></td>
-    <td><small>${fcDetails(c)}${c.registry?.name ? `<br><span class="muted">registered: ${esc(c.registry.name)}${c.registry.current_status ? ' · ' + esc(c.registry.current_status) : ''}</span>` : ''}${c.crawl_status === 'running' ? '<span class="spinner"></span>' : c.crawl_status === 'failed' ? `<span class="err">${esc(c.crawl_error || 'website could not be read')}</span>` : ''}</small></td>
+    <td><small>${fcDetails(c)}${c.registry?.name ? `<br><span class="muted">registered: ${esc(c.registry.name)}${c.registry.current_status ? ' · ' + esc(c.registry.current_status) : ''}</span>` : ''}${c.crawl_status === 'running' ? '<span class="spinner"></span>' : c.crawl_status === 'failed' ? `<span class="err">${esc(c.crawl_error || 'website could not be read')}</span>` : c.crawl_status === 'blocked by robots.txt' ? `<br><span class="muted">robots.txt asks crawlers not to visit this site, so its listing contacts are used</span>` : ''}</small></td>
     <td class="btns">${c.job_id && c.crawl_status === 'completed' ? `<button class="ghost" onclick="openJob('${esc(c.job_id)}')">Full profile</button>` : ''}</td></tr>`; }).join('');
   $('fcMore').classList.toggle('hidden', fcShown >= n);
   $('fcMore').textContent = `Show next 25 (${n - fcShown} more)`;
@@ -293,7 +301,7 @@ function fcRender(r) {
 }
 async function fcLoadLists() {
   const rows = await api('/api/companies');
-  $('fcLists').innerHTML = rows.map(x => `<div class="history-row"><small>${esc(x.created_at.replace('T', ' ').slice(0, 19))}</small><b>${esc(x.label)}</b><small>${esc(x.status)} · ${x.count}</small><button class="ghost" onclick="fcOpen('${esc(x.id)}')">Open</button></div>`).join('') || '<p class="muted">No searches yet.</p>';
+  $('fcLists').innerHTML = rows.map(x => `<div class="history-row"><small>${esc(x.created_at.replace('T', ' ').slice(0, 19))}</small><b>${esc(x.label)}</b><small>${esc(x.status)} · ${x.count}</small><button class="ghost" onclick="fcOpen('${esc(x.id)}')">Open</button><button class="ghost danger" onclick="fcDelete('${esc(x.id)}')">Delete</button></div>`).join('') || '<p class="muted">No searches yet.</p>';
 }
 async function fcOpen(id) { fcId = id; fcShown = 25; await fcPoll(); $('fcResult').scrollIntoView({behavior: 'smooth', block: 'start'}); }
 document.addEventListener('click', e => {

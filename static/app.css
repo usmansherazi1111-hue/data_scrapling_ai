@@ -40,3 +40,5 @@ table.mini{width:100%;border-collapse:collapse;margin-bottom:10px}table.mini th,
 @media(max-width:1000px){.fc-form{grid-template-columns:1fr}}
 .chip-btn{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:14px;padding:3px 10px;font-size:12px;cursor:pointer;margin:2px}.chip-btn:hover{border-color:var(--accent)}
 #fcFacets{margin:8px 0}.tag{font-size:10px;border:1px solid var(--line);border-radius:4px;padding:0 4px;color:var(--muted);text-transform:uppercase}
+#companies .history-row,#history .history-row{grid-template-columns:140px 1fr 110px 80px 80px;align-items:center}
+button.danger{color:var(--danger)}

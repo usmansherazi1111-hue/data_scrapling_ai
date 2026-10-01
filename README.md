@@ -94,7 +94,8 @@ Restart the app after editing `.env`.
 1. Type any **Industry** (textile, medicine, software, steel... any word) and a **Country** (`pk`, `Pakistan`, `UK`). Company name is optional.
 2. Click **Find companies**. The app reads the open **Overture Maps** places data (no key, no account) and lists the companies whose category or name matches your words, best contact details first. **How many** (25 to 200, default 50) keeps the list manageable.
 3. It then opens every company website by itself and collects emails, phones, people, social links, tech and a lead score (the same as *Crawl one website*). The progress bar shows `done / total`.
-4. Click **Download Excel**: sheet **Summary** (one row per company, each row links to its own sheet), then **one sheet per company** (all details, people, emails, phones), then **Sources**. CSV is also available. The table shows 25 rows at a time (*Show next 25*).
+4. Each search under **Earlier searches**, and each crawl under **History**, has a **Delete** button (asks first) so the lists stay short.
+5. Click **Download Excel**: sheet **Summary** (one row per company, each row links to its own sheet), then **one sheet per company** (all details, people, emails, phones), then **Sources**. CSV is also available. The table shows 25 rows at a time (*Show next 25*).
 
 **How the right companies are picked.** No per-industry lists exist: your words are matched against Overture's category path (for example `manufacturing_and_industrial > textile_manufacturer`) and the company name. Each match gets a relevance level, shown in the **Why listed** column and used to sort the list:
 - *category*: the word is the company's own category ("textile manufacturer").
@@ -109,6 +110,8 @@ Under the results, **category chips** show which categories the matches fall int
 3. **OpenStreetMap by name** (Nominatim, one request per second, only for a place with exactly the company's name) when the website, phone or email is missing.
 4. The company website. If it will not open, https and with/without `www` variants are tried once.
 5. The official register (GLEIF, free; Companies House or OpenCorporates when keyed): legal name, LEI or company number, status and registered address. This is **off by default** (`GAPFILL_REGISTRY=1` turns it on): in a measured run it matched 1 company in 25 and made the list much slower, because the register allows one request at a time.
+
+**Sites that disallow crawlers (robots.txt).** The app always obeys robots.txt. If the home page is disallowed, it tries the usual contact pages (`/contact`, `/about`...) that robots.txt allows. If nothing may be read, the company shows "blocked by robots.txt" (not a failure) and keeps its listing and OpenStreetMap contacts. It never works around a robots.txt block.
 
 Set `GAPFILL_NOMINATIM=0` to skip step 3, or `COMPANY_TRY_ALT_URLS=0` to skip the alternate-address retry.
 
