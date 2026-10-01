@@ -161,3 +161,17 @@ def test_old_release_cache_is_pruned(tmp_path):
     new = tmp_path / "2026-09-23.0"; new.mkdir()
     overture.prune_old_releases(new / "PK.parquet")
     assert not old.exists() and new.exists()
+
+
+@pytest.mark.asyncio
+async def test_register_lookup_is_off_unless_enabled(monkeypatch):
+    from scraper import registries
+    calls = []
+    async def fake_match(name, cc, *a, **k): calls.append(name); return {"name": "Reg Ltd", "lei": "L1", "source": "gleif"}, {}
+    monkeypatch.setattr(registries, "match", fake_match)
+    c = {"name": "Acme Ltd"}
+    await gapfill.registry_fill(c, "pk")
+    assert not calls and "registry" not in c
+    monkeypatch.setenv("GAPFILL_REGISTRY", "1")
+    await gapfill.registry_fill(c, "pk")
+    assert calls == ["Acme Ltd"] and c["registry"]["lei"] == "L1"

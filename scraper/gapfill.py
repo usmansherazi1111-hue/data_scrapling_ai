@@ -5,7 +5,7 @@ Order for one company (each step only runs when something is still missing, and 
   2. sibling listings              other Overture rows with the same company name (done in overture.py)
   3. OpenStreetMap by name         Nominatim search "<company name>" in the country; website, phone and email tags of an exactly named place
   4. the website, alternate form   www / non-www and https variants of an address that did not open
-  5. the official LEI register     GLEIF: legal name, LEI, status and registered address (Companies House / OpenCorporates when keyed)
+  5. the official register (opt-in, GAPFILL_REGISTRY=1)  GLEIF: legal name, LEI, status and registered address (Companies House / OpenCorporates when keyed)
 Nominatim's rules are followed: at most one request per second, a real User-Agent, results cached.
 """
 from __future__ import annotations
@@ -98,6 +98,7 @@ def alt_urls(url: str) -> list[str]:
 async def registry_fill(c: dict, cc: str) -> None:
     """Official record by company name: legal name, LEI / company number, status, registered address."""
     from . import registries
+    if os.getenv("GAPFILL_REGISTRY", "0") != "1": return   # measured: 1 match in 25 and about 80 s extra per list, so it is opt-in
     try:
         m, _errors = await registries.match(c.get("name") or "", cc.lower())
     except Exception:

@@ -108,7 +108,7 @@ Under the results, **category chips** show which categories the matches fall int
 2. Other Overture listings of the same company name (branches, duplicate pins).
 3. **OpenStreetMap by name** (Nominatim, one request per second, only for a place with exactly the company's name) when the website, phone or email is missing.
 4. The company website. If it will not open, https and with/without `www` variants are tried once.
-5. The official register (GLEIF, free; Companies House or OpenCorporates when keyed): legal name, LEI or company number, status and registered address.
+5. The official register (GLEIF, free; Companies House or OpenCorporates when keyed): legal name, LEI or company number, status and registered address. This is **off by default** (`GAPFILL_REGISTRY=1` turns it on): in a measured run it matched 1 company in 25 and made the list much slower, because the register allows one request at a time.
 
 Set `GAPFILL_NOMINATIM=0` to skip step 3, or `COMPANY_TRY_ALT_URLS=0` to skip the alternate-address retry.
 
