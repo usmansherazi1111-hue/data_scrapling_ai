@@ -18,7 +18,7 @@ from scraper import ai, security
 from scraper import opencorporates as oc, registries, overture, gapfill
 from scraper.models import now_iso
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 app = FastAPI(title="Scrapling Studio", version=VERSION)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 DB_PATH = os.getenv("DB_PATH", "./data/scrapling.db")
