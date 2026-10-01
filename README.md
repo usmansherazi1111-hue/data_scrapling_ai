@@ -96,13 +96,25 @@ Restart the app after editing `.env`.
 3. It then opens every company website by itself and collects emails, phones, people, social links, tech and a lead score (the same as *Crawl one website*). The progress bar shows `done / total`.
 4. Click **Download Excel**: sheet **Summary** (one row per company, each row links to its own sheet), then **one sheet per company** (all details, people, emails, phones), then **Sources**. CSV is also available. The table shows 25 rows at a time (*Show next 25*).
 
-No per-industry lists exist: your words are matched against Overture's category path (for example `manufacturing_and_industrial > textile_manufacturer`) and the company name, using the first five letters of longer words so `medicine` also finds `medical`. Coverage is what Overture holds: in a measured run for Pakistan, "textile" matched 642 companies, "software" 2,323 and "medicine" 4,818, and most of the top results have a website and an email. It is broad, not a complete official register.
+**How the right companies are picked.** No per-industry lists exist: your words are matched against Overture's category path (for example `manufacturing_and_industrial > textile_manufacturer`) and the company name. Each match gets a relevance level, shown in the **Why listed** column and used to sort the list:
+- *category*: the word is the company's own category ("textile manufacturer").
+- *parent category* / *related category*: a broader category, or a category that only shares the word's stem ("pharmacy" for "pharmaceutical").
+- *name only*: only the company name contains the word, or only a very broad top-level category (such as "health and medical") matches. These come last, so they appear only when there are not enough better matches.
 
-A few related categories widen common words (for example "software" also finds `information_technology_company`, "textile" also finds spinning, weaving and apparel manufacturers); after that change "textile" matched 1,473 and "software" 2,751 for Pakistan. Branches that share a website are merged into one company (the `locations` column counts them), and bigger companies (more locations, a legal name such as Ltd / Pvt) rank higher.
+Under the results, **category chips** show which categories the matches fall into, with counts (for example for "medicine" in Pakistan: physical therapy, pharmaceutical company, surgical supplies...). Click one to narrow the list to that category; the data is cached on your PC, so this takes about a second.
 
-The first search for a country downloads that country's part of the public Overture files once (about 45 seconds for Pakistan, 34 MB in `data/overture/<release>/`); later searches for that country read the local copy in under a second, and a new Overture release is fetched automatically. Set `OVERTURE_CACHE=0` to always read Overture directly (capped by `OVERTURE_SCAN_SECONDS`, default 300). Website crawls run 8 at a time (`COMPANY_CRAWL_CONCURRENCY`) with a 25 s cap per page and 45 s per site (`COMPANY_PAGE_SECONDS`, `COMPANY_SITE_SECONDS`); 100 textile companies in Pakistan took about 3 minutes in a measured run. Set `OVERTURE_RELEASE` to pin a release. A company name without a country searches the official LEI register (GLEIF).
+**Filling empty fields.** Each company goes through these sources in order, and a source is only asked for what is still missing. The result shows where every value came from (`website`, `listing`, `OpenStreetMap`, `sibling listing`, `alternate address`, or the register name), and a `missing` column lists what no source could supply:
+1. Overture's own listing (website, phone, email, social links).
+2. Other Overture listings of the same company name (branches, duplicate pins).
+3. **OpenStreetMap by name** (Nominatim, one request per second, only for a place with exactly the company's name) when the website, phone or email is missing.
+4. The company website. If it will not open, https and with/without `www` variants are tried once.
+5. The official register (GLEIF, free; Companies House or OpenCorporates when keyed): legal name, LEI or company number, status and registered address.
 
-Only public company websites are read, robots.txt is respected, and companies without a website keep the phone and email that Overture lists. Data licence: (c) Overture Maps Foundation, CDLA Permissive 2.0.
+Set `GAPFILL_NOMINATIM=0` to skip step 3, or `COMPANY_TRY_ALT_URLS=0` to skip the alternate-address retry.
+
+Coverage is what these open sources hold. In measured runs the top 100 companies had a website in 95 to 100 of 100 and an email in 61 to 100 of 100, depending on industry and country, because the list ranks companies with contact details first. Deeper in a long list, more fields are empty and the gap-fill steps matter more. It is broad, not a complete official register.
+
+Each search reads the country's part of the public Overture files directly. The first search for a country downloads it once to `data\overture` (tens of MB, under a minute); later searches take a second. Older releases are deleted automatically. A search that was running when the app was closed is marked "interrupted" at the next start.
 
 ### Crawl one website
 
@@ -160,7 +172,8 @@ scraper/
   auth.py             Auth profiles and the interactive login browser
   security.py         Password login, private-address guard, local-only actions
   ai.py               Optional OpenAI-compatible client
-  overture.py         Industry + country company lists from Overture Maps (open data), countries.json
+  overture.py         Industry + country company lists from Overture Maps (open data): relevance levels, category chips, country cache
+  gapfill.py          Fills empty fields from OpenStreetMap by name, alternate web addresses and the official register
   registries.py       Company-registry sources for crawl enrichment
   gleif.py            GLEIF LEI API client (free, no key)
   companieshouse.py   UK Companies House API client (free key): search, profile, officers

@@ -36,3 +36,15 @@ class HistoryDB:
         with sqlite3.connect(self.path) as c:
             row=c.execute("SELECT result_json FROM registry_lists WHERE id=?",(list_id,)).fetchone()
         return json.loads(row[0]) if row else None
+
+    def fail_stale(self):
+        """A run still marked 'running' when the app starts was cut off by a restart: mark it so it does not look alive forever."""
+        with sqlite3.connect(self.path) as c:
+            rows=c.execute("SELECT id,result_json FROM registry_lists WHERE status='running'").fetchall()
+            for rid,js in rows:
+                d=json.loads(js); d["status"]="completed" if d.get("companies") else "failed"; d["progress"]="interrupted (the app was restarted)"
+                d["error"]=d.get("error") or "Interrupted when the app was restarted. Search again to resume."
+                if d.get("crawl",{}).get("status")=="running": d["crawl"]["status"]="interrupted"
+                c.execute("UPDATE registry_lists SET status=?, result_json=? WHERE id=?",(d["status"],json.dumps(d,ensure_ascii=False),rid))
+            c.commit()
+        return len(rows)

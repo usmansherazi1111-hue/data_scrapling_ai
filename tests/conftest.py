@@ -14,6 +14,10 @@ def oc_env(monkeypatch):
     monkeypatch.delenv("COMPANIES_HOUSE_API_KEY", raising=False)
     for api in (gleif.API, companieshouse.API):
         monkeypatch.setattr(api, "min_interval", 0); api.cache.clear()
+    monkeypatch.setenv("GAPFILL_NOMINATIM", "0")      # tests never touch the network; gap-fill tests turn it on with mocked responses
+    monkeypatch.setenv("NOMINATIM_MIN_INTERVAL", "0")
+    from scraper import gapfill
+    gapfill._cache.clear()
     oc.clear_cache()
     yield
     oc.clear_cache()

@@ -242,7 +242,9 @@ async function saveCookies() {
 const SRC_NAMES = {gleif: 'GLEIF', companieshouse: 'Companies House', opencorporates: 'OpenCorporates', directory: 'OpenStreetMap + Wikidata', osm: 'OpenStreetMap', wikidata: 'Wikidata'};
 // ------------------------------------------------------------------ find companies: industry + country -> list -> automatic crawl -> Excel
 let fcId = null, fcTimer = null, fcShown = 25;
-const fcSite = c => c.website ? link(/^https?:/i.test(c.website) ? c.website : 'http://' + c.website, c.website.replace(/^https?:\/\/(www\.)?/i, '').replace(/\/$/, '').slice(0, 40)) : '<span class="muted">no website listed</span>';
+const srcTag = (c, f) => { const s = (c.best_source || {})[f]; return s && s !== 'website' ? ` <span class="tag">${esc(s)}</span>` : ''; };
+const fcSite0 = c => c.website ? link(/^https?:/i.test(c.website) ? c.website : 'http://' + c.website, c.website.replace(/^https?:\/\/(www\.)?/i, '').replace(/\/$/, '').slice(0, 40)) : '<span class="muted">no website listed</span>';
+const fcSite = c => { const b = c.best || {}, w = b.website || c.website; return w ? link(/^https?:/i.test(w) ? w : 'http://' + w, w.replace(/^https?:\/\/(www\.)?/i, '').replace(/\/$/, '').slice(0, 40)) + srcTag(c, 'website') : '<span class="muted">no website found</span>'; };
 function fcDetails(c) {
   const d = c.details || {}, out = [];
   if (d.decision_maker) out.push(`${esc(d.decision_maker)}${d.decision_maker_title ? ' (' + esc(d.decision_maker_title) + ')' : ''}`);
@@ -254,8 +256,8 @@ function fcDetails(c) {
   if (d.lead_score != null) out.push(`score ${esc(d.lead_score)}${d.lead_grade ? ' (' + esc(d.lead_grade) + ')' : ''}`);
   return out.join('<br>');
 }
-async function fcSearch() {
-  const body = {industry: $('fcInd').value.trim(), country: $('fcCountry').value.trim(), name: $('fcName').value.trim(), limit: +$('fcLimit').value};
+async function fcSearch(category) {
+  const body = {industry: $('fcInd').value.trim(), country: $('fcCountry').value.trim(), name: $('fcName').value.trim(), limit: +$('fcLimit').value, category: typeof category === 'string' ? category : ''};
   try { fcId = (await api('/api/companies/search', {method: 'POST', body: JSON.stringify(body)})).id; fcShown = 25; fcPoll(); } catch (e) { alert(e.message); }
 }
 async function fcPoll() {
@@ -271,16 +273,20 @@ function fcRender(r) {
   $('fcNotes').innerHTML = (r.notes || []).map(x => `<p class="muted small">${esc(x)}</p>`).join('') + (r.error ? `<p class="err small">${esc(r.error)}</p>` : '');
   const crawling = cr.status === 'running';
   $('fcProgress').innerHTML = r.status === 'running' ? `<span class="spinner"></span> ${esc(r.progress)}`
-    : crawling ? `<span class="spinner"></span> Getting emails, phones, people and social links from each website: ${cr.done} of ${cr.total}${cr.current ? ' (' + esc(cr.current) + ')' : ''}`
-    : `${n} companies` + (cr.total ? ` · ${cr.done - cr.failed} websites crawled${cr.failed ? `, ${cr.failed} could not be read` : ''}` : '');
+    : crawling ? `<span class="spinner"></span> Collecting contact details (website, OpenStreetMap, official register): ${cr.done} of ${cr.total}${cr.current ? ' (' + esc(cr.current) + ')' : ''}`
+    : `${n} companies` + (cr.total ? ` · ${cr.done} companies processed${cr.failed ? `, ${cr.failed} website(s) could not be read` : ''}` : '');
   $('fcBar').style.width = cr.total ? Math.round(100 * cr.done / cr.total) + '%' : '0%';
   $('fcExports').classList.toggle('hidden', !n);
   for (const k of ['Xlsx', 'Csv']) $('fc' + k).href = `/api/companies/${r.id}/export/${k.toLowerCase()}`;
-  $('fcRows').innerHTML = cs.slice(0, fcShown).map((c, i) => `<tr><td>${i + 1}</td>
-    <td><b>${esc(c.name)}</b><br><small class="muted">${esc([c.category, c.city].filter(Boolean).join(' · '))}</small></td>
-    <td><small>${fcSite(c)}${c.phone ? `<br>${esc(c.phone)}` : ''}${c.email ? `<br>${esc(c.email)}` : ''}</small></td>
-    <td><small>${fcDetails(c)}${c.crawl_status === 'running' ? '<span class="spinner"></span>' : c.crawl_status === 'failed' ? `<span class="err">${esc(c.crawl_error || 'website could not be read')}</span>` : ''}</small></td>
-    <td class="btns">${c.job_id && c.crawl_status === 'completed' ? `<button class="ghost" onclick="openJob('${esc(c.job_id)}')">Full profile</button>` : ''}</td></tr>`).join('');
+  const facets = r.facets || [];
+  $('fcFacets').innerHTML = facets.length > 1 ? '<span class="muted small">Narrow by category: </span>' + facets.map(f => `<button class="chip-btn" onclick="fcSearch('${esc(f.category).replace(/'/g, "\\'")}')">${esc(f.category)} <small>${f.count}</small></button>`).join('') : '';
+  $('fcRows').innerHTML = cs.slice(0, fcShown).map((c, i) => { const b = c.best || {};
+    const email = b.email || c.email, phone = b.phone || c.phone, miss = (c.missing || []).filter(x => c.crawl_status !== 'running' && x !== 'contact_person');
+    return `<tr><td>${i + 1}</td>
+    <td><b>${esc(c.name)}</b><br><small class="muted">${esc([c.category, c.city].filter(Boolean).join(' · '))}</small>${c.match && c.match !== 'category' ? `<br><small class="warn">${esc(c.match)}</small>` : ''}</td>
+    <td><small>${fcSite(c)}${phone ? `<br>${esc(phone)}${srcTag(c, 'phone')}` : ''}${email ? `<br>${esc(email)}${srcTag(c, 'email')}` : ''}${miss.length ? `<br><span class="muted">missing: ${esc(miss.join(', '))}</span>` : ''}</small></td>
+    <td><small>${fcDetails(c)}${c.registry?.name ? `<br><span class="muted">registered: ${esc(c.registry.name)}${c.registry.current_status ? ' · ' + esc(c.registry.current_status) : ''}</span>` : ''}${c.crawl_status === 'running' ? '<span class="spinner"></span>' : c.crawl_status === 'failed' ? `<span class="err">${esc(c.crawl_error || 'website could not be read')}</span>` : ''}</small></td>
+    <td class="btns">${c.job_id && c.crawl_status === 'completed' ? `<button class="ghost" onclick="openJob('${esc(c.job_id)}')">Full profile</button>` : ''}</td></tr>`; }).join('');
   $('fcMore').classList.toggle('hidden', fcShown >= n);
   $('fcMore').textContent = `Show next 25 (${n - fcShown} more)`;
   $('fcAttribution').textContent = (cs[0]?.source === 'gleif') ? 'GLEIF LEI data: CC0.' : 'Company data: (c) Overture Maps Foundation, CDLA Permissive 2.0.';
@@ -298,7 +304,7 @@ document.addEventListener('click', e => {
 });
 $('start').onclick = start; $('refresh').onclick = loadHistory; $('refreshProfiles').onclick = loadProfiles;
 $('bOpen').onclick = openBrowser; $('bFinish').onclick = finishBrowser; $('cSave').onclick = saveCookies;
-$('fcSearch').onclick = fcSearch; ['fcInd', 'fcCountry', 'fcName'].forEach(id => $(id).addEventListener('keydown', e => { if (e.key === 'Enter') fcSearch(); })); $('fcMore').onclick = () => { fcShown += 25; fcPoll(); };
+$('fcSearch').onclick = () => fcSearch(); ['fcInd', 'fcCountry', 'fcName'].forEach(id => $(id).addEventListener('keydown', e => { if (e.key === 'Enter') fcSearch(); })); $('fcMore').onclick = () => { fcShown += 25; fcPoll(); };
 api('/api/status').then(s => {
   if (s.version) $('appVersion').textContent = 'v' + s.version;
   $('providers').innerHTML = `<div class="prov"><span class="${s.ai ? 'ok' : 'nf'}">●</span> AI ${s.ai ? esc(s.ai_model) : 'off'}</div><div class="prov"><span class="${s.hunter ? 'ok' : 'nf'}">●</span> Hunter.io ${s.hunter ? 'on' : 'off'}</div>${(s.registries || []).map(x => `<div class="prov"><span class="${x.configured ? 'ok' : 'nf'}">●</span> ${esc(SRC_NAMES[x.id])} ${x.configured ? 'on' : 'off'}</div>`).join('')}`;

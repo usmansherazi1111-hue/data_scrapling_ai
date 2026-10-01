@@ -1,6 +1,6 @@
 from __future__ import annotations
 from urllib.parse import urlparse
-import asyncio, csv, io, json, os, re, uuid
+import asyncio, csv, io, json, os, re, time, uuid
 from fastapi import FastAPI, HTTPException, Request, Form
 from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -15,14 +15,14 @@ from scraper.urltools import normalize_url
 from scraper.auth import ProfileStore, parse_cookies
 from scraper.enrichment import flatten
 from scraper import ai, security
-from scraper import opencorporates as oc, registries, overture
+from scraper import opencorporates as oc, registries, overture, gapfill
 from scraper.models import now_iso
 
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 app = FastAPI(title="Scrapling Studio", version=VERSION)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 DB_PATH = os.getenv("DB_PATH", "./data/scrapling.db")
-DB = HistoryDB(DB_PATH); JOBS = {}; TASKS = set(); REGISTRY_RUNS = {}
+DB = HistoryDB(DB_PATH); DB.fail_stale(); JOBS = {}; TASKS = set(); REGISTRY_RUNS = {}
 PROFILES = ProfileStore(os.path.join(os.path.dirname(DB_PATH) or ".", "profiles"))
 ENGINE = CrawlEngine(DB, JOBS, PROFILES)
 
@@ -200,6 +200,7 @@ class CompanySearchRequest(BaseModel):
     country: str = Field(default="", max_length=60)     # "pk", "Pakistan", "UK"
     name: str = Field(default="", max_length=100)       # optional: only companies whose name contains this
     limit: int = Field(default=50, ge=5, le=MAX_LIST)   # how many companies to keep and crawl
+    category: str = Field(default="", max_length=100)   # optional: only this category (the chips under the results)
     crawl: bool = True
 
 
@@ -236,39 +237,72 @@ async def domain_resolves(url: str) -> bool:
         return True   # slow or odd resolver: let the crawl decide
 
 
-async def crawl_company(c: dict, sem, state, run):
-    async with sem:
-        url = company_site(c)
-        c["crawl_status"] = "running"; state["current"] = c.get("name")
-        try:
-            if not url or not await security.is_public_url(url): raise ValueError("website is not a public address")
-            if not await domain_resolves(url): raise ValueError("website domain does not exist (DNS)")
-            job_id = uuid.uuid4().hex[:12]; c["job_id"] = job_id
-            cfg = CrawlRequest(url=url, max_pages=CRAWL_PAGES, depth=1, ai_enrichment=True, registry_lookup=False, timeout=CRAWL_FETCH_MS, concurrency=CRAWL_PAGES).model_dump()
-            cfg.update(page_time_limit=CRAWL_PAGE_SECONDS, time_budget=CRAWL_SITE_SECONDS, markdown=False, parse_in_thread=os.getenv("COMPANY_PARSE_IN_THREAD", "1") != "0")
-            res = (await ENGINE.run(job_id, url, cfg)).jsonable()
-            c["crawl_status"] = res["status"]
-            if "pages" in res and not any(200 <= (p.get("status") or 0) < 400 for p in res["pages"]):
-                codes = sorted({str(p.get("status") or p.get("error") or "no answer")[:40] for p in res["pages"]})
-                c["crawl_status"] = "failed"; c["crawl_error"] = "website not readable (" + ", ".join(codes[:3]) + ")"; state["failed"] += 1
-            c["details"] = {k: v for k, v in flatten(res.get("enrichment")).items() if v not in (None, "", False)}
-            c["profile"] = keep_profile(res.get("enrichment"))
-            if res["status"] != "completed" and not c.get("crawl_error"): c["crawl_error"] = str((res.get("stats") or {}).get("error", ""))[:200]
-        except Exception as e:
-            c["crawl_status"] = "failed"; c["crawl_error"] = str(e)[:200]; state["failed"] += 1
-        state["done"] += 1; DB.save_registry(run)
+def maybe_save(run, force=False):
+    """Writing the whole list after every company is O(n squared); save at most every few seconds."""
+    now = time.monotonic()
+    if force or now - run.get("_saved", 0) > 3:
+        run["_saved"] = now; DB.save_registry({k: v for k, v in run.items() if not k.startswith("_")})
+
+
+async def crawl_site(c: dict, url: str):
+    job_id = uuid.uuid4().hex[:12]; c["job_id"] = job_id
+    cfg = CrawlRequest(url=url, max_pages=CRAWL_PAGES, depth=1, ai_enrichment=True, registry_lookup=False, timeout=CRAWL_FETCH_MS, concurrency=CRAWL_PAGES).model_dump()
+    cfg.update(page_time_limit=CRAWL_PAGE_SECONDS, time_budget=CRAWL_SITE_SECONDS, markdown=False, parse_in_thread=os.getenv("COMPANY_PARSE_IN_THREAD", "1") != "0")
+    res = (await ENGINE.run(job_id, url, cfg)).jsonable()
+    readable = "pages" not in res or any(200 <= (p.get("status") or 0) < 400 for p in res["pages"])
+    return res, readable
+
+
+async def process_company(c: dict, cc: str, sem, state, run):
+    """Listing -> (missing website? ask OpenStreetMap) -> crawl site (alternate address if it will not open) -> official register -> best value per field."""
+    try:
+        await gapfill.discover_listing(c, cc)
+        registry = asyncio.create_task(gapfill.registry_fill(c, cc))   # runs alongside the crawl
+        async with sem:
+            url = company_site(c)
+            c["crawl_status"] = "running"; state["current"] = c.get("name")
+            if not url:
+                c["crawl_status"] = "no website"
+            else:
+                tried, error = [], None
+                for cand in [url] + gapfill.alt_urls(url):
+                    try:
+                        if not await security.is_public_url(cand): error = "website is not a public address"; continue
+                        if not await domain_resolves(cand): error = "website domain does not exist (DNS)"; continue
+                        res, readable = await crawl_site(c, cand)
+                    except Exception as e:
+                        error = str(e)[:200]; tried.append(cand); continue
+                    tried.append(cand)
+                    if readable:
+                        c["crawl_status"] = res["status"]; error = None
+                        c["details"] = {k: v for k, v in flatten(res.get("enrichment")).items() if v not in (None, "", False)}
+                        c["profile"] = keep_profile(res.get("enrichment"))
+                        if cand != url: c["website"] = cand; c.setdefault("filled_from", {})["website"] = "alternate address"
+                        break
+                    codes = sorted({str(p.get("status") or p.get("error") or "no answer")[:40] for p in res.get("pages", [])})
+                    error = "website not readable (" + ", ".join(codes[:3]) + ")"
+                    if os.getenv("COMPANY_TRY_ALT_URLS", "1") == "0": break
+                if error:
+                    c["crawl_status"] = "failed"; c["crawl_error"] = error; state["failed"] += 1
+        try: await asyncio.wait_for(registry, 60)
+        except Exception: registry.cancel()
+    except Exception as e:
+        c["crawl_status"] = "failed"; c["crawl_error"] = str(e)[:200]; state["failed"] += 1
+    gapfill.merge_best(c)
+    state["done"] += 1; maybe_save(run)
 
 
 async def run_company_search(run, req: CompanySearchRequest):
-    error = None
+    error = None; cc = overture.country_code(req.country)
     try:
-        cc = overture.country_code(req.country)
         if cc:
             run["progress"] = f"reading open company data for {overture.country_name(cc)}"
             def progress(m): run["progress"] = m
-            res = await overture.search(req.industry, req.country, req.name, req.limit, progress=progress)
-            run["companies"] = res["companies"]; run["total_count"] = res["matched"]
-            run["notes"].append(f"{res['matched']:,} companies match. Showing the {len(res['companies'])} with the most contact details (websites and emails first).")
+            res = await overture.search(req.industry, req.country, req.name, req.limit, category=req.category, progress=progress)
+            run["companies"] = res["companies"]; run["total_count"] = res["matched"]; run["facets"] = res.get("facets", [])
+            n_weak = sum(1 for c in res["companies"] if c.get("match") == "name only")
+            run["notes"].append(f"{res['matched']:,} companies match ({res.get('relevant', 0):,} by category). Showing the best {len(res['companies'])}: category matches first, then those with the most contact details.")
+            if n_weak: run["notes"].append(f"{n_weak} are listed because only their name contains the word (check the Why listed column), or narrow by category below.")
             if res.get("partial"): run["notes"].append(res["partial"])
         elif req.country.strip():
             raise overture.OvertureError(f"Unknown country '{req.country.strip()}'. Use a country name or a 2-letter code like pk, gb or us.")
@@ -282,24 +316,24 @@ async def run_company_search(run, req: CompanySearchRequest):
     except Exception as e:
         error = str(e)[:500]
     run["status"] = "failed" if error and not run["companies"] else "completed"; run["error"] = error
-    DB.save_registry(run)
+    maybe_save(run, True)
     if req.crawl and run["companies"]:
-        todo = [c for c in run["companies"] if company_site(c)]
+        todo = run["companies"] if cc else [c for c in run["companies"] if company_site(c)]
         state = run["crawl"] = {"status": "running", "done": 0, "total": len(todo), "failed": 0, "current": None, "started_at": now_iso()}
-        run["progress"] = f"crawling {len(todo)} company websites"; DB.save_registry(run)
+        run["progress"] = f"collecting contact details for {len(todo)} companies"; maybe_save(run, True)
         sem = asyncio.Semaphore(CRAWL_CONCURRENCY)
         try:
-            await asyncio.gather(*(crawl_company(c, sem, state, run) for c in todo))
+            await asyncio.gather(*(process_company(c, cc or "", sem, state, run) for c in todo))
         finally:
             state.update(status="completed", current=None, finished_at=now_iso())
-    run["progress"] = "done"; run["finished_at"] = now_iso(); DB.save_registry(run); REGISTRY_RUNS.pop(run["id"], None)
+    run["progress"] = "done"; run["finished_at"] = now_iso(); maybe_save(run, True); REGISTRY_RUNS.pop(run["id"], None)
 
 
 @app.post("/api/companies/search")
 async def companies_search(req: CompanySearchRequest):
     if not (req.industry.strip() or req.name.strip()): raise HTTPException(400, "Enter an industry (for example textile) and a country (for example pk)")
     if req.industry.strip() and not req.country.strip(): raise HTTPException(400, "Enter a country too, for example pk or Pakistan")
-    run = new_run(" · ".join(x for x in (req.industry.strip(), req.country.strip(), req.name.strip()) if x), req.model_dump())
+    run = new_run(" · ".join(x for x in (req.industry.strip(), req.country.strip(), req.name.strip(), req.category.strip()) if x), req.model_dump())
     background(run_company_search(run, req))
     return {"id": run["id"]}
 
@@ -320,19 +354,28 @@ async def companies_list(list_id: str): return run_for(list_id)
 
 LICENCES = {"overture": "Overture Maps places: (c) Overture Maps Foundation, CDLA Permissive 2.0. https://overturemaps.org",
             "gleif": "GLEIF LEI data: CC0 (no restrictions). https://www.gleif.org"}
-SUMMARY_COLS = ["name", "category", "city", "country_code", "registered_address", "website", "email", "phone", "lead_score", "lead_grade", "decision_maker", "decision_maker_title",
-                "decision_maker_email", "all_emails", "phones_e164", "social_linkedin", "social_facebook", "social_instagram", "social_twitter", "tech_stack", "crawl_status", "source"]
+SUMMARY_COLS = ["name", "category", "match", "city", "country_code", "website", "website_source", "email", "email_source", "phone", "phone_source", "decision_maker",
+                "decision_maker_title", "decision_maker_email", "all_emails", "phones_e164", "social_linkedin", "social_facebook", "social_instagram", "social_twitter",
+                "lead_score", "lead_grade", "tech_stack", "legal_name", "lei", "registry_status", "registered_address", "locations", "missing", "crawl_status", "crawl_error", "source"]
+HIDE = {"source_id", "category_path", "confidence", "job_id", "jurisdiction_code", "filled_from", "best", "best_source", "registry", "profile", "details", "socials"}
 
 
 def summary_row(c):
-    d = dict(c.get("details") or {})
-    row = {**{k: v for k, v in c.items() if k not in ("details", "profile", "socials")}, **d}
+    d = dict(c.get("details") or {}); b = c.get("best") or {}; bs = c.get("best_source") or {}; g = c.get("registry") or {}
+    row = {**{k: v for k, v in c.items() if k not in HIDE}, **d}
+    for f in ("email", "phone", "website"):
+        if b.get(f): row[f] = b[f]
+        if bs.get(f): row[f + "_source"] = bs[f]
+    for k, v in b.items():
+        if k.startswith("social_"): row[k] = v
+    if b.get("contact_person") and not row.get("decision_maker"): row["decision_maker"] = b["contact_person"]
     emails = [e.strip() for e in str(row.get("all_emails") or "").split(",") if e.strip()]
-    if c.get("email") and c["email"] not in emails: emails.insert(0, c["email"]); row["all_emails"] = ", ".join(emails)
-    for s in c.get("socials") or []:
-        for k in ("linkedin", "facebook", "instagram", "twitter"):
-            if k in s and not row.get(f"social_{k}"): row[f"social_{k}"] = s
-    return row
+    if b.get("email") and b["email"] not in emails: emails.insert(0, b["email"])
+    if emails: row["all_emails"] = ", ".join(emails)
+    row.update(legal_name=g.get("name"), lei=g.get("lei") or g.get("company_number"), registry_status=g.get("current_status"))
+    if g.get("registered_address") and not row.get("registered_address"): row["registered_address"] = g["registered_address"]
+    row["missing"] = ", ".join(c.get("missing") or [])
+    return {k: v for k, v in row.items() if not isinstance(v, dict)}
 
 
 def sheet_name(i, name, used):
@@ -347,7 +390,7 @@ def build_workbook(r):
     from openpyxl.styles import Font, PatternFill
     from openpyxl.utils import get_column_letter
     cs = r["companies"]; wb = Workbook(); ws = wb.active; ws.title = "Summary"; used = {"summary", "sources"}
-    extra = [k for k in dict.fromkeys(k for c in cs for k in summary_row(c)) if k not in SUMMARY_COLS and k not in ("source_id", "category_path", "confidence", "job_id", "crawl_error", "jurisdiction_code")]
+    extra = [k for k in dict.fromkeys(k for c in cs for k in summary_row(c)) if k not in SUMMARY_COLS and k not in HIDE]
     cols = [c for c in SUMMARY_COLS if any(summary_row(x).get(c) not in (None, "") for x in cs)] + [k for k in extra if any(summary_row(x).get(k) not in (None, "") for x in cs)]
     names = [sheet_name(i, c.get("name"), used) for i, c in enumerate(cs, 1)]
     ws.append(["sheet"] + cols)
