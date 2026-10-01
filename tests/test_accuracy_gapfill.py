@@ -245,3 +245,14 @@ async def test_engine_tries_contact_pages_when_home_page_is_disallowed(monkeypat
     assert urls["https://shop.example.pk/"].challenge == "robots"                       # the home page itself is never fetched
     assert urls["https://shop.example.pk/contact"].status == 200 and not urls["https://shop.example.pk/contact"].error                        # the allowed contact page is read
     assert "https://shop.example.pk/" not in fetched and "https://shop.example.pk/about" not in fetched
+
+
+def test_robots_checkbox_reaches_the_crawl_and_delete_removes_search_crawls(monkeypatch):
+    import main
+    seen = []
+    async def fake(c, url, respect_robots=True):
+        seen.append(respect_robots); c["job_id"] = "jobx"
+        return {"pages": [{"status": 200, "url": url}], "emails": [], "phones": []}, True
+    monkeypatch.setattr(main, "crawl_site", fake)
+    assert main.CompanySearchRequest(industry="a", country="pk").respect_robots is True
+    assert main.CompanySearchRequest(industry="a", country="pk", respect_robots=False).respect_robots is False

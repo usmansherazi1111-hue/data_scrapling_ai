@@ -18,7 +18,7 @@ from scraper import ai, security
 from scraper import opencorporates as oc, registries, overture, gapfill
 from scraper.models import now_iso
 
-VERSION = "2.1.2"
+VERSION = "2.1.3"
 app = FastAPI(title="Scrapling Studio", version=VERSION)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 DB_PATH = os.getenv("DB_PATH", "./data/scrapling.db")
@@ -211,6 +211,7 @@ class CompanySearchRequest(BaseModel):
     limit: int = Field(default=50, ge=5, le=MAX_LIST)   # how many companies to keep and crawl
     category: str = Field(default="", max_length=100)   # optional: only this category (the chips under the results)
     crawl: bool = True
+    respect_robots: bool = True                          # untick only with permission to read sites that ask crawlers to stay out
 
 
 def new_run(label, query):
@@ -253,9 +254,9 @@ def maybe_save(run, force=False):
         run["_saved"] = now; DB.save_registry({k: v for k, v in run.items() if not k.startswith("_")})
 
 
-async def crawl_site(c: dict, url: str):
+async def crawl_site(c: dict, url: str, respect_robots: bool = True):
     job_id = uuid.uuid4().hex[:12]; c["job_id"] = job_id
-    cfg = CrawlRequest(url=url, max_pages=CRAWL_PAGES, depth=1, ai_enrichment=True, registry_lookup=False, timeout=CRAWL_FETCH_MS, concurrency=CRAWL_PAGES).model_dump()
+    cfg = CrawlRequest(url=url, max_pages=CRAWL_PAGES, depth=1, ai_enrichment=True, registry_lookup=False, timeout=CRAWL_FETCH_MS, concurrency=CRAWL_PAGES, respect_robots=respect_robots).model_dump()
     cfg.update(page_time_limit=CRAWL_PAGE_SECONDS, time_budget=CRAWL_SITE_SECONDS, markdown=False, parse_in_thread=os.getenv("COMPANY_PARSE_IN_THREAD", "1") != "0")
     res = (await ENGINE.run(job_id, url, cfg)).jsonable()
     readable = "pages" not in res or any(200 <= (p.get("status") or 0) < 400 for p in res["pages"])
@@ -278,7 +279,7 @@ async def process_company(c: dict, cc: str, sem, state, run):
                     try:
                         if not await security.is_public_url(cand): error = "website is not a public address"; continue
                         if not await domain_resolves(cand): error = "website domain does not exist (DNS)"; continue
-                        res, readable = await crawl_site(c, cand)
+                        res, readable = await crawl_site(c, cand, (run.get("query") or {}).get("respect_robots", True))
                     except Exception as e:
                         error = str(e)[:200]; tried.append(cand); continue
                     tried.append(cand)
@@ -290,7 +291,7 @@ async def process_company(c: dict, cc: str, sem, state, run):
                         break
                     if any(p.get("challenge") == "robots" for p in res.get("pages", [])):
                         # Respected, not worked around: the site asked crawlers to stay away, so only listing and OpenStreetMap contacts are used.
-                        c["crawl_status"] = "blocked by robots.txt"; c["crawl_error"] = "The site's robots.txt asks crawlers not to visit it. Listing contacts are kept."
+                        c["crawl_status"] = "blocked by robots.txt"; c["crawl_error"] = "The site's robots.txt asks crawlers not to visit it. Listing contacts are kept. Untick Respect robots.txt and search again only if you have permission to read it."
                         error = None; robots_blocked = True
                         break
                     codes = sorted({str(p.get("status") or p.get("error") or "no answer")[:40] for p in res.get("pages", [])})
@@ -369,7 +370,10 @@ async def companies_list(list_id: str): return run_for(list_id)
 @app.delete("/api/companies/{list_id}")
 async def companies_delete(list_id: str):
     if list_id in REGISTRY_RUNS: raise HTTPException(409, "This search is still running")
+    run = DB.get_registry(list_id)
     if not DB.delete_registry(list_id): raise HTTPException(404, "List not found")
+    for c in (run or {}).get("companies", []):   # the website crawls this search made go with it; crawls started by hand stay
+        if c.get("job_id"): DB.delete_job(c["job_id"])
     return {"ok": True}
 
 

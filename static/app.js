@@ -265,7 +265,7 @@ function fcDetails(c) {
   return out.join('<br>');
 }
 async function fcSearch(category) {
-  const body = {industry: $('fcInd').value.trim(), country: $('fcCountry').value.trim(), name: $('fcName').value.trim(), limit: +$('fcLimit').value, category: typeof category === 'string' ? category : ''};
+  const body = {industry: $('fcInd').value.trim(), country: $('fcCountry').value.trim(), name: $('fcName').value.trim(), limit: +$('fcLimit').value, category: typeof category === 'string' ? category : '', respect_robots: $('fcRobots').checked};
   try { fcId = (await api('/api/companies/search', {method: 'POST', body: JSON.stringify(body)})).id; fcShown = 25; fcPoll(); } catch (e) { alert(e.message); }
 }
 async function fcPoll() {
@@ -293,7 +293,7 @@ function fcRender(r) {
     return `<tr><td>${i + 1}</td>
     <td><b>${esc(c.name)}</b><br><small class="muted">${esc([c.category, c.city].filter(Boolean).join(' · '))}</small>${c.match && c.match !== 'category' ? `<br><small class="warn">${esc(c.match)}</small>` : ''}</td>
     <td><small>${fcSite(c)}${phone ? `<br>${esc(phone)}${srcTag(c, 'phone')}` : ''}${email ? `<br>${esc(email)}${srcTag(c, 'email')}` : ''}${miss.length ? `<br><span class="muted">missing: ${esc(miss.join(', '))}</span>` : ''}</small></td>
-    <td><small>${fcDetails(c)}${c.registry?.name ? `<br><span class="muted">registered: ${esc(c.registry.name)}${c.registry.current_status ? ' · ' + esc(c.registry.current_status) : ''}</span>` : ''}${c.crawl_status === 'running' ? '<span class="spinner"></span>' : c.crawl_status === 'failed' ? `<span class="err">${esc(c.crawl_error || 'website could not be read')}</span>` : c.crawl_status === 'blocked by robots.txt' ? `<br><span class="muted">robots.txt asks crawlers not to visit this site, so its listing contacts are used</span>` : ''}</small></td>
+    <td><small>${fcDetails(c)}${c.registry?.name ? `<br><span class="muted">registered: ${esc(c.registry.name)}${c.registry.current_status ? ' · ' + esc(c.registry.current_status) : ''}</span>` : ''}${c.crawl_status === 'running' ? '<span class="spinner"></span>' : c.crawl_status === 'failed' ? `<span class="err">${esc(c.crawl_error || 'website could not be read')}</span>` : c.crawl_status === 'blocked by robots.txt' ? `<br><span class="muted">robots.txt asks crawlers not to visit this site, so its listing contacts are used. Untick <i>Respect robots.txt</i> and search again only if you have permission</span>` : ''}</small></td>
     <td class="btns">${c.job_id && c.crawl_status === 'completed' ? `<button class="ghost" onclick="openJob('${esc(c.job_id)}')">Full profile</button>` : ''}</td></tr>`; }).join('');
   $('fcMore').classList.toggle('hidden', fcShown >= n);
   $('fcMore').textContent = `Show next 25 (${n - fcShown} more)`;
